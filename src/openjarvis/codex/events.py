@@ -368,15 +368,21 @@ class CodexEventAdapter:
         if baseline is None:
             last_values = self._usage_breakdown(last)
             if not last_values:
-                # Without a prior persisted turn snapshot or a response delta we
-                # cannot safely distinguish current-turn usage from cumulative
-                # thread usage. Leave the event as thread-only rather than
-                # over-counting the turn.
-                return params
-            baseline = {
-                name: max(0, total_values.get(name, 0) - last_values.get(name, 0))
-                for name in _USAGE_KEYS
-            }
+                # A total-only snapshot is a safe turn total only when this is
+                # provably the first durable turn on the owned thread. For any
+                # later/resumed turn, leave it thread-only rather than risk
+                # enforcing a per-turn limit against cumulative usage.
+                if self._store.count_turns(thread_id) != 1:
+                    return params
+                baseline = {name: 0 for name in _USAGE_KEYS}
+            else:
+                baseline = {
+                    name: max(
+                        0,
+                        total_values.get(name, 0) - last_values.get(name, 0),
+                    )
+                    for name in _USAGE_KEYS
+                }
         self._usage_baselines[key] = baseline
         turn_usage = {
             name: max(0, total_values.get(name, 0) - baseline.get(name, 0))

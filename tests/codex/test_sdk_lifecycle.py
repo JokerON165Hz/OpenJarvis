@@ -575,6 +575,71 @@ async def test_token_limit_interrupts_turn(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_later_total_only_usage_is_not_treated_as_turn_usage(
+    tmp_path: Path,
+) -> None:
+    first_handle = FakeTurnHandle(
+        "turn-1",
+        [
+            {
+                "method": "thread/tokenUsage/updated",
+                "eventId": "usage-event-1",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "tokenUsage": {"total": {"totalTokens": 5}},
+                },
+            }
+        ],
+    )
+    fake = FakeSdk()
+    fake.started_thread = FakeThread("thread-1", turn_handle=first_handle)
+    store = CodexStateStore(tmp_path / "codex.db")
+    backend = _backend(fake, store)
+    await backend.start_thread(
+        ThreadStartRequest(context=_context(tmp_path, "thread-correlation"))
+    )
+    first = await backend.start_turn(
+        TurnStartRequest(
+            context=_context(tmp_path, "turn-correlation-1", token_limit=10),
+            thread_id="thread-1",
+            prompt="Read only",
+        )
+    )
+    first_events = [event async for event in backend.stream_events(first.turn_id)]
+    assert first_events[0].payload["turn_usage"]["totalTokens"] == 5
+
+    second_handle = FakeTurnHandle(
+        "turn-2",
+        [
+            {
+                "method": "thread/tokenUsage/updated",
+                "eventId": "usage-event-2",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-2",
+                    "tokenUsage": {"total": {"totalTokens": 15}},
+                },
+            }
+        ],
+    )
+    fake.started_thread.turn_handle = second_handle
+    second = await backend.start_turn(
+        TurnStartRequest(
+            context=_context(tmp_path, "turn-correlation-2", token_limit=10),
+            thread_id="thread-1",
+            prompt="Continue read only",
+        )
+    )
+    second_events = [event async for event in backend.stream_events(second.turn_id)]
+
+    assert "turn_usage" not in second_events[0].payload
+    assert second_handle.interrupt_count == 0
+    await backend.close()
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_explicit_interrupt_updates_persisted_turn(tmp_path: Path) -> None:
     handle = FakeTurnHandle("turn-1")
     fake = FakeSdk()

@@ -410,6 +410,15 @@ class CodexStateStore:
         ).fetchone()
         return self._turn_from_row(row) if row else None
 
+    def count_turns(self, thread_id: str) -> int:
+        """Return the durable number of turns bound to one owned thread."""
+
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM codex_turns WHERE thread_id=?",
+            (thread_id,),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
     def get_turn_by_correlation(
         self,
         correlation_id: str,
