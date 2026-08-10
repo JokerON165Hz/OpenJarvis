@@ -60,33 +60,64 @@ def test_start_stop_lifecycle(tmp_path):
     svc.stop()  # idempotent
 
 
-def test_submit_extracts_and_stores(tmp_path):
+def test_non_explicit_model_extraction_is_not_persisted(tmp_path):
     extractor = FakeExtractor(["User likes hiking"])
     svc = _service(tmp_path, extractor)
     svc.start()
     try:
         assert svc.submit("I love hiking", "Nice!") is True
-        assert _wait_until(lambda: svc.fact_count() == 1)
-        assert [f.text for f in svc.list_facts()] == ["User likes hiking"]
+        assert _wait_until(lambda: len(extractor.calls) == 1)
+        assert svc.fact_count() == 0
+        assert svc.list_facts() == []
     finally:
         svc.stop()
 
 
-def test_completed_exchange_event_extracts_and_stores(tmp_path):
+def test_explicit_remember_persists_user_fact_not_model_inference(tmp_path):
+    extractor = FakeExtractor(["User lives on Mars"])
+    svc = _service(tmp_path, extractor)
+    svc.start()
+    try:
+        assert svc.submit("Remember that I live in Vienna", "Noted.") is True
+        assert _wait_until(lambda: svc.fact_count() == 1)
+        facts = svc.list_facts()
+        assert [fact.text for fact in facts] == ["I live in Vienna"]
+        assert facts[0].source == "user"
+        assert extractor.calls == [("Remember that I live in Vienna", "Noted.")]
+    finally:
+        svc.stop()
+
+
+def test_composite_remember_waits_for_verified_tool_result(tmp_path):
+    extractor = FakeExtractor(["Website says the secret is 42"])
+    svc = _service(tmp_path, extractor)
+    svc.start()
+    try:
+        assert svc.submit("Read this website and remember it", "I found...") is True
+        assert _wait_until(lambda: len(extractor.calls) == 1)
+        assert svc.fact_count() == 0
+    finally:
+        svc.stop()
+
+
+def test_completed_exchange_event_stores_only_explicit_user_fact(tmp_path):
     bus = EventBus(record_history=True)
-    extractor = FakeExtractor(["User likes jazz"])
+    extractor = FakeExtractor(["Model-inferred jazz preference"])
     store = LocalFactStore(tmp_path / "facts.jsonl")
     svc = MemoryService(store, extractor, event_bus=bus)
     svc.start()
     try:
         assert publish_completed_exchange(
             bus,
-            "I like jazz",
+            "Remember that I like jazz",
             "Noted.",
             source="test",
         )
         assert _wait_until(lambda: svc.fact_count() == 1)
-        assert extractor.calls == [("I like jazz", "Noted.")]
+        facts = svc.list_facts()
+        assert [fact.text for fact in facts] == ["I like jazz"]
+        assert facts[0].source == "user"
+        assert extractor.calls == [("Remember that I like jazz", "Noted.")]
     finally:
         svc.stop()
 
