@@ -11,6 +11,7 @@ from openjarvis.codex.cli_backend import CliProcessResult, CodexCliFallbackBacke
 from openjarvis.codex.events import CodexEventAdapter
 from openjarvis.codex.protocol import CodexBackend
 from openjarvis.codex.router import CodexBackendRouter
+from openjarvis.codex.runtime_stability import install_backend_stability_patches
 from openjarvis.codex.sdk_backend import CodexPythonSdkBackend
 from openjarvis.codex.store import (
     CodexStateStore,
@@ -39,6 +40,10 @@ from openjarvis.codex.types import (
     ThreadStartRequest,
     TurnStartRequest,
 )
+
+# Keep the public backend protocol unchanged while applying lifecycle fixes to
+# the concrete app-server/SDK implementations imported above.
+install_backend_stability_patches()
 
 __all__ = [
     "ApprovalMode",
