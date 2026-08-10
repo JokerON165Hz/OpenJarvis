@@ -7,12 +7,18 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
+from typing import Iterator
 
 _MAX_DIFF_CHARS = 40_000
+_LOCK_DIRNAME = ".locks"
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 def _now() -> str:
@@ -80,12 +86,6 @@ def safe_target(vault_root: Path, relative_path: str) -> Path:
         raise UnsafeMemoryPath("memory writes are limited to Markdown files")
 
     target = root.joinpath(*windows.parts)
-    resolved = target.resolve(strict=False)
-    try:
-        resolved.relative_to(root)
-    except ValueError as exc:
-        raise UnsafeMemoryPath("memory path escapes the configured vault root") from exc
-
     current = root
     for part in windows.parts:
         current = current / part
@@ -93,6 +93,12 @@ def safe_target(vault_root: Path, relative_path: str) -> Path:
             raise UnsafeMemoryPath(
                 "memory path crosses a symlink or Windows junction"
             )
+
+    resolved = target.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise UnsafeMemoryPath("memory path escapes the configured vault root") from exc
     return resolved
 
 
@@ -116,8 +122,71 @@ def unified_diff(
     return result
 
 
+def _thread_lock(lock_path: Path) -> threading.Lock:
+    key = os.path.normcase(str(lock_path.resolve(strict=False)))
+    with _THREAD_LOCKS_GUARD:
+        return _THREAD_LOCKS.setdefault(key, threading.Lock())
+
+
+def _lock_file(handle) -> None:
+    """Acquire an OS-backed non-blocking one-byte lock."""
+
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise ConcurrentMemoryWrite(
+                "another memory writer is active for this target"
+            ) from exc
+        return
+
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        raise ConcurrentMemoryWrite(
+            "another memory writer is active for this target"
+        ) from exc
+
+
+def _unlock_file(handle) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort directory sync after a replace on platforms that support it."""
+
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        os.fsync(descriptor)
+    except OSError:
+        # The file payload itself has already been fsynced. Some filesystems do
+        # not permit fsync on directories, so durability degrades gracefully.
+        return
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 class AtomicMarkdownWriter:
-    """Apply one already-approved write and retain an external restore artifact."""
+    """Apply one approved write without losing concurrent changes."""
 
     def __init__(self, vault_root: str | Path, restore_root: str | Path) -> None:
         self.vault_root = Path(vault_root).expanduser().resolve(strict=True)
@@ -134,6 +203,48 @@ class AtomicMarkdownWriter:
         before = target.read_bytes() if target.exists() else None
         return target, before, sha256_bytes(before) if before is not None else None
 
+    @contextmanager
+    def _target_lock(self, relative_path: str) -> Iterator[None]:
+        """Serialize cooperating writers across threads and processes.
+
+        The lock lives outside the vault and is backed by the operating system,
+        so the kernel releases it automatically if a writer process crashes.
+        """
+
+        safe_target(self.vault_root, relative_path)
+        self.restore_root.mkdir(parents=True, exist_ok=True)
+        lock_root = self.restore_root / _LOCK_DIRNAME
+        lock_root.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
+        lock_path = lock_root / f"{digest}.lock"
+        local_lock = _thread_lock(lock_path)
+        with local_lock:
+            with lock_path.open("a+b") as handle:
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                _lock_file(handle)
+                try:
+                    yield
+                finally:
+                    _unlock_file(handle)
+
+    @staticmethod
+    def _validate_expected(
+        *,
+        before: bytes | None,
+        current_hash: str | None,
+        expected_hash: str | None,
+    ) -> None:
+        if expected_hash is None and before is not None:
+            raise ConcurrentMemoryWrite(
+                "target was created after the candidate was prepared"
+            )
+        if expected_hash is not None and current_hash != expected_hash:
+            raise ConcurrentMemoryWrite(
+                "target changed after the candidate was prepared"
+            )
+
     def write(
         self,
         relative_path: str,
@@ -144,17 +255,30 @@ class AtomicMarkdownWriter:
     ) -> AtomicWriteResult:
         """Compare-and-swap one Markdown file using same-filesystem replace."""
 
+        with self._target_lock(relative_path):
+            return self._write_locked(
+                relative_path,
+                content,
+                expected_hash=expected_hash,
+                operation_id=operation_id,
+            )
+
+    def _write_locked(
+        self,
+        relative_path: str,
+        content: str,
+        *,
+        expected_hash: str | None,
+        operation_id: str | None,
+    ) -> AtomicWriteResult:
         started_at = _now()
         actual_operation_id = operation_id or uuid.uuid4().hex
         target, before, current_hash = self.inspect(relative_path)
-        if expected_hash is None and before is not None:
-            raise ConcurrentMemoryWrite(
-                "target was created after the candidate was prepared"
-            )
-        if expected_hash is not None and current_hash != expected_hash:
-            raise ConcurrentMemoryWrite(
-                "target changed after the candidate was prepared"
-            )
+        self._validate_expected(
+            before=before,
+            current_hash=current_hash,
+            expected_hash=expected_hash,
+        )
 
         payload = content.encode("utf-8")
         after_hash = sha256_bytes(payload)
@@ -164,15 +288,10 @@ class AtomicMarkdownWriter:
         self._validate_created_parents(target)
         self.restore_root.mkdir(parents=True, exist_ok=True)
         restore_path = self.restore_root / f"{actual_operation_id}.restore"
-        self._write_restore(
-            restore_path,
-            relative_path=relative_path,
-            before=before,
-            before_hash=current_hash,
-            after_hash=after_hash,
-        )
 
         temporary_path: Path | None = None
+        restore_created = False
+        committed = False
         try:
             with tempfile.NamedTemporaryFile(
                 mode="wb",
@@ -185,14 +304,36 @@ class AtomicMarkdownWriter:
                 handle.flush()
                 os.fsync(handle.fileno())
                 temporary_path = Path(handle.name)
+
+            # Close the remaining race window for external writers that changed
+            # the target while our temporary file was being prepared.
+            _target, latest, latest_hash = self.inspect(relative_path)
+            self._validate_expected(
+                before=latest,
+                current_hash=latest_hash,
+                expected_hash=expected_hash,
+            )
+
+            self._write_restore(
+                restore_path,
+                relative_path=relative_path,
+                before=before,
+                before_hash=current_hash,
+                after_hash=after_hash,
+            )
+            restore_created = True
             os.replace(temporary_path, target)
             temporary_path = None
+            _fsync_directory(target.parent)
+            committed = True
             actual_after = target.read_bytes()
             if sha256_bytes(actual_after) != after_hash:
                 raise OSError("post-write hash verification failed")
         finally:
             if temporary_path is not None and temporary_path.exists():
                 temporary_path.unlink()
+            if restore_created and not committed and restore_path.exists():
+                restore_path.unlink()
 
         return AtomicWriteResult(
             operation_id=actual_operation_id,
@@ -214,24 +355,26 @@ class AtomicMarkdownWriter:
     ) -> str | None:
         """Restore the prior bytes only if the applied file is still unchanged."""
 
-        target, current, current_hash = self.inspect(result.path)
-        expected = expected_after_hash or result.after_hash
-        if current is None or current_hash != expected:
-            raise ConcurrentMemoryWrite("target changed after the approved write")
-        restore_path = Path(result.restore_path)
-        manifest, before = self._read_restore(restore_path)
-        if manifest["after_hash"] != result.after_hash:
-            raise ConcurrentMemoryWrite("restore artifact does not match the write")
-        if manifest["created_file"]:
-            target.unlink()
-            return None
-        if before is None:
-            raise OSError("restore artifact is missing prior file bytes")
-        self._replace_bytes(target, before)
-        restored_hash = sha256_bytes(target.read_bytes())
-        if restored_hash != manifest["before_hash"]:
-            raise OSError("restore hash verification failed")
-        return restored_hash
+        with self._target_lock(result.path):
+            target, current, current_hash = self.inspect(result.path)
+            expected = expected_after_hash or result.after_hash
+            if current is None or current_hash != expected:
+                raise ConcurrentMemoryWrite("target changed after the approved write")
+            restore_path = Path(result.restore_path)
+            manifest, before = self._read_restore(restore_path)
+            if manifest["after_hash"] != result.after_hash:
+                raise ConcurrentMemoryWrite("restore artifact does not match the write")
+            if manifest["created_file"]:
+                target.unlink()
+                _fsync_directory(target.parent)
+                return None
+            if before is None:
+                raise OSError("restore artifact is missing prior file bytes")
+            self._replace_bytes(target, before)
+            restored_hash = sha256_bytes(target.read_bytes())
+            if restored_hash != manifest["before_hash"]:
+                raise OSError("restore hash verification failed")
+            return restored_hash
 
     def _validate_created_parents(self, target: Path) -> None:
         current = target.parent
@@ -259,6 +402,7 @@ class AtomicMarkdownWriter:
                 temporary_path = Path(handle.name)
             os.replace(temporary_path, target)
             temporary_path = None
+            _fsync_directory(target.parent)
         finally:
             if temporary_path is not None and temporary_path.exists():
                 temporary_path.unlink()
@@ -286,6 +430,7 @@ class AtomicMarkdownWriter:
                 handle.write(before)
             handle.flush()
             os.fsync(handle.fileno())
+        _fsync_directory(path.parent)
 
     @staticmethod
     def _read_restore(path: Path) -> tuple[dict[str, object], bytes | None]:
