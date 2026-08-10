@@ -53,7 +53,10 @@ class _TerminalFacts:
     content: str = ""
     active_commands: set[str] = field(default_factory=set)
     open_file_changes: set[str] = field(default_factory=set)
+    active_tools: set[str] = field(default_factory=set)
     pending_approvals: set[str] = field(default_factory=set)
+    recoverable_failures: set[str] = field(default_factory=set)
+    recoverable_failure: bool = False
     budget_warning: bool = False
     budget_interrupted: bool = False
 
@@ -65,6 +68,7 @@ class _TerminalFacts:
             and not self.interrupted
             and not self.active_commands
             and not self.open_file_changes
+            and not self.active_tools
             and not self.pending_approvals
         )
 
@@ -226,9 +230,14 @@ class CodexTaskOrchestrator:
             raise RuntimeError("task disappeared before its turn started")
         if current.status in {
             TaskStatus.PENDING,
+            TaskStatus.RUNNING,
             TaskStatus.PAUSED,
             TaskStatus.RECOVERING,
-        }:
+        } and (
+            current.status is not TaskStatus.RUNNING
+            or current.active_thread_id != thread.thread_id
+            or current.active_turn_id != turn.turn_id
+        ):
             self._tasks.transition(
                 task.task_id,
                 TaskStatus.RUNNING,
@@ -243,7 +252,9 @@ class CodexTaskOrchestrator:
         self._active_turns[task.task_id] = (turn.turn_id, backend, turn_context)
         try:
             async for event in backend.stream_events(turn.turn_id):
-                self._projector.project(event)
+                projection = self._projector.project(event)
+                if projection.stale or not projection.inserted:
+                    continue
                 self._observe(facts, event)
                 if event.event_type is CodexEventType.USAGE_UPDATED:
                     decision = self._budget.observe(
@@ -258,7 +269,11 @@ class CodexTaskOrchestrator:
                         facts.interrupted = True
         except Exception as exc:
             current = self._tasks.get(task.task_id)
-            if current is not None and current.status is TaskStatus.RUNNING:
+            if (
+                current is not None
+                and current.status is TaskStatus.RUNNING
+                and current.active_turn_id == turn.turn_id
+            ):
                 try:
                     self._tasks.transition(
                         task.task_id,
@@ -281,7 +296,9 @@ class CodexTaskOrchestrator:
                     pass
             raise
         finally:
-            self._active_turns.pop(task.task_id, None)
+            active = self._active_turns.get(task.task_id)
+            if active is not None and active[0] == turn.turn_id:
+                self._active_turns.pop(task.task_id, None)
         self._project_persisted_events(thread.thread_id)
 
         final_task = self._finish_task(
@@ -417,6 +434,8 @@ class CodexTaskOrchestrator:
         current = self._tasks.get(task_id)
         if current is None:
             raise RuntimeError("task disappeared after its Codex turn")
+        if current.active_turn_id and current.active_turn_id != turn_id:
+            return current
         if current.status in {TaskStatus.PAUSED, TaskStatus.CANCELED}:
             return current
         if current.status is TaskStatus.WAITING_APPROVAL:
@@ -445,6 +464,21 @@ class CodexTaskOrchestrator:
                     "budget_limit" if facts.budget_interrupted else "interrupted"
                 ),
                 budget_warning=facts.budget_warning,
+            )
+        if facts.failed and facts.recoverable_failure:
+            return self._tasks.transition(
+                task_id,
+                TaskStatus.PAUSED,
+                component="codex_task_orchestrator",
+                cause="recoverable_codex_turn_failed",
+                idempotency_key=f"{transition_key}:recoverable-failed",
+                result=facts.content,
+                payload={
+                    "error_category": "recoverable_tool_failure",
+                    "failed_items": sorted(facts.recoverable_failures),
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                },
             )
         if facts.failed:
             return self._tasks.transition(
@@ -484,6 +518,7 @@ class CodexTaskOrchestrator:
             payload={
                 "active_commands": sorted(facts.active_commands),
                 "open_file_changes": sorted(facts.open_file_changes),
+                "active_tools": sorted(facts.active_tools),
                 "pending_approvals": sorted(facts.pending_approvals),
                 "terminal_event_received": facts.completed,
             },
@@ -496,10 +531,18 @@ class CodexTaskOrchestrator:
             facts.active_commands.add(item_key)
         elif event.event_type is CodexEventType.COMMAND_COMPLETED:
             facts.active_commands.discard(item_key)
+            if CodexTaskOrchestrator._event_failed(event):
+                facts.recoverable_failures.add(item_key)
         elif event.event_type is CodexEventType.FILE_CHANGE_PROPOSED:
             facts.open_file_changes.add(item_key)
         elif event.event_type is CodexEventType.FILE_CHANGE_APPLIED:
             facts.open_file_changes.discard(item_key)
+        elif event.event_type is CodexEventType.TOOL_STARTED:
+            facts.active_tools.add(item_key)
+        elif event.event_type is CodexEventType.TOOL_COMPLETED:
+            facts.active_tools.discard(item_key)
+            if CodexTaskOrchestrator._event_failed(event):
+                facts.recoverable_failures.add(item_key)
         elif event.event_type is CodexEventType.APPROVAL_REQUESTED:
             facts.pending_approvals.add(item_key)
         elif event.event_type is CodexEventType.APPROVAL_RESOLVED:
@@ -508,11 +551,50 @@ class CodexTaskOrchestrator:
             facts.completed = True
         elif event.event_type is CodexEventType.TURN_FAILED:
             facts.failed = True
+            facts.recoverable_failure = bool(
+                facts.recoverable_failures
+                or CodexTaskOrchestrator._explicitly_recoverable(event)
+            )
         elif event.event_type is CodexEventType.TURN_INTERRUPTED:
             facts.interrupted = True
         content = CodexTaskOrchestrator._event_content(event)
         if content:
             facts.content = content
+
+    @staticmethod
+    def _event_failed(event: CodexEvent) -> bool:
+        """Detect a completed command/tool item that reports a failed effect."""
+
+        candidates: list[Any] = [event.payload]
+        item = event.payload.get("item")
+        if isinstance(item, dict):
+            candidates.append(item)
+        result = event.payload.get("result")
+        if isinstance(result, dict):
+            candidates.append(result)
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            status = candidate.get("status")
+            if isinstance(status, str) and status.lower() in {
+                "error",
+                "errored",
+                "failed",
+                "failure",
+            }:
+                return True
+            if candidate.get("success") is False:
+                return True
+            if candidate.get("error") not in {None, "", False}:
+                return True
+        return False
+
+    @staticmethod
+    def _explicitly_recoverable(event: CodexEvent) -> bool:
+        if event.payload.get("recoverable") is True:
+            return True
+        error = event.payload.get("error")
+        return isinstance(error, dict) and error.get("recoverable") is True
 
     @staticmethod
     def _event_content(event: CodexEvent) -> str:

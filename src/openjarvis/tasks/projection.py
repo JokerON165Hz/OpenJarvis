@@ -10,7 +10,7 @@ from openjarvis.codex.redaction import redact_data
 from openjarvis.codex.types import CodexEvent, CodexEventType
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.tasks.store import TaskStore
-from openjarvis.tasks.types import TaskArtifact, TaskEvent
+from openjarvis.tasks.types import TaskArtifact, TaskEvent, TaskRecord
 from openjarvis.traces.store import TraceStore
 
 
@@ -22,6 +22,7 @@ class ProjectionResult:
     inserted: bool
     trace_projected: bool
     artifact: TaskArtifact | None = None
+    stale: bool = False
 
 
 class CodexTaskEventProjector:
@@ -59,7 +60,17 @@ class CodexTaskEventProjector:
         if task.session_id != event.session_id:
             raise ValueError("Codex event session does not own the task")
 
+        stale = self._is_stale(task, event)
         payload, artifact = self._bounded_payload(event)
+        if stale:
+            payload = {
+                **payload,
+                "_projection": {
+                    "stale": True,
+                    "active_thread_id": task.active_thread_id,
+                    "active_turn_id": task.active_turn_id,
+                },
+            }
         task_event, inserted = self._store.append_event(
             task_id=event.task_id,
             source_event_id=event.event_id,
@@ -75,7 +86,9 @@ class CodexTaskEventProjector:
             payload=payload,
         )
 
-        if event.item_id:
+        # A duplicate source event has already had its durable effects applied.
+        # A stale event belongs to a superseded turn/thread and is audit-only.
+        if event.item_id and inserted and not stale:
             self._store.save_item(
                 item_id=event.item_id,
                 task_id=event.task_id,
@@ -99,7 +112,7 @@ class CodexTaskEventProjector:
                     for row in self._trace_store.list_task_events(task_event.task_id)
                 )
 
-        if inserted and self._bus is not None:
+        if inserted and not stale and self._bus is not None:
             self._bus.publish(
                 EventType.CODEX_EVENT,
                 {
@@ -125,6 +138,19 @@ class CodexTaskEventProjector:
             inserted=inserted,
             trace_projected=trace_projected,
             artifact=artifact,
+            stale=stale,
+        )
+
+    @staticmethod
+    def _is_stale(task: TaskRecord, event: CodexEvent) -> bool:
+        """Return whether an event belongs to a superseded execution identity."""
+
+        if task.active_thread_id and event.thread_id != task.active_thread_id:
+            return True
+        return bool(
+            event.turn_id
+            and task.active_turn_id
+            and event.turn_id != task.active_turn_id
         )
 
     def _bounded_payload(

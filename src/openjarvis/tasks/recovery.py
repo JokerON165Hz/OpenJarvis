@@ -100,6 +100,7 @@ class RecoveryCoordinator:
         ambiguous_effect = bool(
             effects["active_commands"]
             or effects["open_file_changes"]
+            or effects["active_tools"]
             or (task.risk_level > 0 and prior_status is TaskStatus.RUNNING)
         )
 
@@ -141,7 +142,10 @@ class RecoveryCoordinator:
                 payload=effects,
             )
             decision = RecoveryDecision.PAUSED_AMBIGUOUS
-            reason = "A command, file change, or workspace-write effect is ambiguous."
+            reason = (
+                "A command, file change, tool call, or workspace-write effect "
+                "is ambiguous."
+            )
         else:
             safe_to_resume = task.risk_level == 0
             if resume_safe is None:
@@ -218,6 +222,7 @@ class RecoveryCoordinator:
     def _effect_facts(self, task_id: str) -> dict[str, list[str]]:
         active_commands: set[str] = set()
         open_file_changes: set[str] = set()
+        active_tools: set[str] = set()
         for event in self._store.list_task_events(task_id):
             key = event.item_id or event.event_id
             if event.event_type == "command.started":
@@ -228,9 +233,14 @@ class RecoveryCoordinator:
                 open_file_changes.add(key)
             elif event.event_type == "file_change.applied":
                 open_file_changes.discard(key)
+            elif event.event_type == "tool.started":
+                active_tools.add(key)
+            elif event.event_type == "tool.completed":
+                active_tools.discard(key)
         return {
             "active_commands": sorted(active_commands),
             "open_file_changes": sorted(open_file_changes),
+            "active_tools": sorted(active_tools),
         }
 
 

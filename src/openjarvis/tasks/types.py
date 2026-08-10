@@ -64,6 +64,9 @@ ALLOWED_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = {
     ),
     TaskStatus.RUNNING: frozenset(
         {
+            # A RUNNING self-transition is reserved for rebinding the task to
+            # a newly started turn while preserving the canonical main state.
+            TaskStatus.RUNNING,
             TaskStatus.WAITING_APPROVAL,
             TaskStatus.PAUSED,
             TaskStatus.RECOVERING,
@@ -97,7 +100,10 @@ ALLOWED_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.CANCELED,
         }
     ),
-    TaskStatus.FAILED: frozenset({TaskStatus.RECOVERING}),
+    # FAILED is intentionally terminal. Recoverable execution faults are
+    # represented by PAUSED/RECOVERING so callers cannot accidentally revive
+    # a task that has already been classified as terminally failed.
+    TaskStatus.FAILED: frozenset(),
     TaskStatus.DONE: frozenset(),
     TaskStatus.CANCELED: frozenset(),
 }
