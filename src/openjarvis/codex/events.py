@@ -52,6 +52,45 @@ _TOOL_ITEM_TYPES = {
     "dynamicToolCall",
     "collabAgentToolCall",
 }
+_REPLAY_SAFE_METHODS = frozenset(
+    {
+        "thread/started",
+        "thread/resumed",
+        "thread/closed",
+        "turn/started",
+        "turn/completed",
+        "item/started",
+        "item/completed",
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "approval/requested",
+        "approval/resolved",
+        "thread/tokenUsage/updated",
+        "error",
+    }
+)
+_USAGE_KEYS = (
+    "inputTokens",
+    "cachedInputTokens",
+    "cacheWriteInputTokens",
+    "outputTokens",
+    "reasoningOutputTokens",
+    "totalTokens",
+)
+_USAGE_KEY_ALIASES = {
+    "inputTokens": ("inputTokens", "input_tokens"),
+    "cachedInputTokens": ("cachedInputTokens", "cached_input_tokens"),
+    "cacheWriteInputTokens": (
+        "cacheWriteInputTokens",
+        "cache_write_input_tokens",
+    ),
+    "outputTokens": ("outputTokens", "output_tokens"),
+    "reasoningOutputTokens": (
+        "reasoningOutputTokens",
+        "reasoning_output_tokens",
+    ),
+    "totalTokens": ("totalTokens", "total_tokens"),
+}
 
 
 class CodexEventAdapter:
@@ -59,6 +98,7 @@ class CodexEventAdapter:
 
     def __init__(self, store: CodexStateStore) -> None:
         self._store = store
+        self._usage_baselines: dict[tuple[str, str], dict[str, int]] = {}
 
     def normalize(
         self,
@@ -72,23 +112,53 @@ class CodexEventAdapter:
         """Normalize and persist one SDK notification or wire message."""
 
         method, params, explicit_event_id = self._unpack(raw)
-        if explicit_event_id and self._store.has_event(explicit_event_id):
-            return None
-
-        event_type = self._event_type(method, params)
-        actual_thread_id = self._find_id(params, "threadId", "thread_id") or thread_id
-        actual_turn_id = (
-            self._find_id(params, "turnId", "turn_id") or turn_id
-        )
-        if actual_turn_id is None:
+        observed_thread_id = self._find_id(params, "threadId", "thread_id")
+        observed_turn_id = self._find_id(params, "turnId", "turn_id")
+        if observed_turn_id is None:
             nested_turn = params.get("turn")
             if isinstance(nested_turn, dict):
-                actual_turn_id = self._find_id(nested_turn, "id")
+                observed_turn_id = self._find_id(nested_turn, "id")
+
+        # The caller binds a stream to one owned thread/turn. Explicit foreign
+        # correlation is stale or belongs to another concurrent stream and must
+        # never be allowed to mutate this one.
+        if observed_thread_id and observed_thread_id != thread_id:
+            return None
+        if turn_id and observed_turn_id and observed_turn_id != turn_id:
+            return None
+
+        actual_thread_id = observed_thread_id or thread_id
+        actual_turn_id = observed_turn_id or turn_id
         item_id = self._find_id(params, "itemId", "item_id")
         if item_id is None:
             item = params.get("item")
             if isinstance(item, dict):
                 item_id = self._find_id(item, "id")
+
+        if method == "thread/tokenUsage/updated":
+            params = self._augment_turn_usage(
+                params,
+                thread_id=actual_thread_id,
+                turn_id=actual_turn_id,
+            )
+        if method in {"error", "turn/completed"}:
+            params = self._augment_structured_error(params, method=method)
+
+        event_type = self._event_type(method, params)
+        replay_event_id = None
+        if explicit_event_id:
+            if self._store.has_event(explicit_event_id):
+                return None
+        elif method in _REPLAY_SAFE_METHODS:
+            replay_event_id = self._stable_replay_event_id(
+                method=method,
+                thread_id=actual_thread_id,
+                turn_id=actual_turn_id,
+                item_id=item_id,
+                params=params,
+            )
+            if self._store.has_event(replay_event_id):
+                return None
 
         if event_type is CodexEventType.ERROR and method not in {
             "error",
@@ -102,7 +172,7 @@ class CodexEventAdapter:
             payload = redact_data(params)
 
         sequence = self._store.next_sequence(actual_thread_id)
-        event_id = explicit_event_id or self._derived_event_id(
+        event_id = explicit_event_id or replay_event_id or self._derived_event_id(
             method=method,
             thread_id=actual_thread_id,
             turn_id=actual_turn_id,
@@ -270,6 +340,180 @@ class CodexEventAdapter:
             if isinstance(value, str) and value:
                 return value
         return datetime.now(timezone.utc).isoformat()
+
+    def _augment_turn_usage(
+        self,
+        params: dict[str, Any],
+        *,
+        thread_id: str,
+        turn_id: str | None,
+    ) -> dict[str, Any]:
+        """Add a cumulative turn snapshot beside the upstream thread snapshot."""
+
+        if not turn_id:
+            return params
+        token_usage = params.get("tokenUsage") or params.get("token_usage")
+        if not isinstance(token_usage, dict):
+            return params
+        total = token_usage.get("total")
+        last = token_usage.get("last")
+        total_values = self._usage_breakdown(total)
+        if not total_values:
+            return params
+
+        key = (thread_id, turn_id)
+        baseline = self._usage_baselines.get(key)
+        if baseline is None:
+            baseline = self._restore_usage_baseline(thread_id, turn_id)
+        if baseline is None:
+            last_values = self._usage_breakdown(last)
+            if not last_values:
+                # Without a prior persisted turn snapshot or a response delta we
+                # cannot safely distinguish current-turn usage from cumulative
+                # thread usage. Leave the event as thread-only rather than
+                # over-counting the turn.
+                return params
+            baseline = {
+                name: max(0, total_values.get(name, 0) - last_values.get(name, 0))
+                for name in _USAGE_KEYS
+            }
+        self._usage_baselines[key] = baseline
+        turn_usage = {
+            name: max(0, total_values.get(name, 0) - baseline.get(name, 0))
+            for name in _USAGE_KEYS
+            if name in total_values or name in baseline
+        }
+        result = dict(params)
+        result["turn_usage"] = turn_usage
+        return result
+
+    def _restore_usage_baseline(
+        self,
+        thread_id: str,
+        turn_id: str,
+    ) -> dict[str, int] | None:
+        try:
+            events = self._store.list_events(thread_id)
+        except Exception:
+            return None
+        for event in reversed(events):
+            if event.turn_id != turn_id or event.event_type is not CodexEventType.USAGE_UPDATED:
+                continue
+            payload = event.payload
+            token_usage = payload.get("tokenUsage") or payload.get("token_usage")
+            turn_usage = payload.get("turn_usage") or payload.get("turnUsage")
+            if not isinstance(token_usage, dict) or not isinstance(turn_usage, dict):
+                continue
+            total_values = self._usage_breakdown(token_usage.get("total"))
+            turn_values = self._usage_breakdown(turn_usage)
+            if total_values and turn_values:
+                return {
+                    name: max(
+                        0,
+                        total_values.get(name, 0) - turn_values.get(name, 0),
+                    )
+                    for name in _USAGE_KEYS
+                }
+        return None
+
+    @staticmethod
+    def _usage_breakdown(block: Any) -> dict[str, int]:
+        if not isinstance(block, dict):
+            return {}
+        result: dict[str, int] = {}
+        for canonical, aliases in _USAGE_KEY_ALIASES.items():
+            for alias in aliases:
+                value = block.get(alias)
+                if isinstance(value, (int, float)) and value >= 0:
+                    result[canonical] = int(value)
+                    break
+        return result
+
+    @classmethod
+    def _augment_structured_error(
+        cls,
+        params: dict[str, Any],
+        *,
+        method: str,
+    ) -> dict[str, Any]:
+        result = dict(params)
+        if method == "turn/completed":
+            turn = result.get("turn")
+            if not isinstance(turn, dict):
+                return result
+            error = turn.get("error")
+            if not isinstance(error, dict):
+                return result
+            normalized = cls._structured_error(error)
+            new_turn = dict(turn)
+            new_turn["error"] = normalized
+            result["turn"] = new_turn
+            result["errorCode"] = normalized.get("code")
+            return result
+
+        error = result.get("error")
+        if not isinstance(error, dict):
+            # Older transports may put only a message at params level.
+            error = {"message": result.get("message", "Codex backend error")}
+        normalized = cls._structured_error(error)
+        result["error"] = normalized
+        result["errorCode"] = normalized.get("code")
+        return result
+
+    @classmethod
+    def _structured_error(cls, error: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(error)
+        info = error.get("codexErrorInfo") or error.get("codex_error_info")
+        code = cls._error_code(info)
+        if code:
+            normalized["code"] = code
+            normalized["retryable"] = code in {
+                "http_connection_failed",
+                "response_stream_connection_failed",
+                "response_stream_disconnected",
+            }
+        return normalized
+
+    @staticmethod
+    def _error_code(info: Any) -> str | None:
+        value: str | None = None
+        if isinstance(info, str):
+            value = info
+        elif isinstance(info, dict):
+            for key in ("type", "kind", "code"):
+                candidate = info.get(key)
+                if isinstance(candidate, str) and candidate:
+                    value = candidate
+                    break
+            if value is None and len(info) == 1:
+                value = str(next(iter(info)))
+        if not value:
+            return None
+        chars: list[str] = []
+        for index, char in enumerate(value):
+            if char.isupper() and index and chars[-1] != "_":
+                chars.append("_")
+            chars.append(char.lower() if char.isalnum() else "_")
+        return "".join(chars).strip("_")
+
+    @staticmethod
+    def _stable_replay_event_id(
+        *,
+        method: str,
+        thread_id: str,
+        turn_id: str | None,
+        item_id: str | None,
+        params: dict[str, Any],
+    ) -> str:
+        raw = json.dumps(
+            [method, thread_id, turn_id, item_id, redact_data(params)],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        return f"replay:{digest}"
 
     @staticmethod
     def _derived_event_id(

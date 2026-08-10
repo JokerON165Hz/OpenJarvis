@@ -21,6 +21,15 @@ _SENSITIVE_KEY_PARTS = (
     "refresh_token",
     "refreshtoken",
     "secret",
+    "account_id",
+    "accountid",
+    "email",
+    "organization_id",
+    "organizationid",
+    "user_id",
+    "userid",
+    "workspace_id",
+    "workspaceid",
 )
 _SENSITIVE_ENV_PARTS = (
     "API_KEY",
@@ -32,18 +41,24 @@ _SENSITIVE_ENV_PARTS = (
 _JWT_PATTERN = re.compile(
     r"\beyJ[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\b"
 )
+_EMAIL_PATTERN = re.compile(
+    r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])",
+    re.IGNORECASE,
+)
 _ASSIGNMENT_PATTERN = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|"
-    r"cookie|password|secret)\b(\s*[:=]\s*)"
+    r"cookie|password|secret|account[_-]?id|organization[_-]?id|"
+    r"workspace[_-]?id|user[_-]?id|email)\b(\s*[:=]\s*)"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
 )
 
 
 def redact_text(text: str) -> str:
-    """Redact common credential formats from arbitrary text."""
+    """Redact common credential and account-identity formats from text."""
 
     stripped = CredentialStripper().strip(text)
     stripped = _JWT_PATTERN.sub("[REDACTED:token]", stripped)
+    stripped = _EMAIL_PATTERN.sub("[REDACTED:email]", stripped)
     return _ASSIGNMENT_PATTERN.sub(
         lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
         stripped,
