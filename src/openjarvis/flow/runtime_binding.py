@@ -37,9 +37,15 @@ class LocalRuntimeBindingProvider:
             user_id = _windows_user_sid()
             os_session_id = _windows_session_id(process_id)
         else:
-            user_id = f"uid:{os.getuid()}" if hasattr(os, "getuid") else getpass.getuser()
+            user_id = (
+                f"uid:{os.getuid()}" if hasattr(os, "getuid") else getpass.getuser()
+            )
             os_session_id = f"sid:{os.getsid(0)}" if hasattr(os, "getsid") else ""
-        binding = RuntimeBinding(user_id=user_id, os_session_id=os_session_id, process_id=process_id)
+        binding = RuntimeBinding(
+            user_id=user_id,
+            os_session_id=os_session_id,
+            process_id=process_id,
+        )
         if not binding.complete():
             raise RuntimeBindingUnavailable("runtime binding is unavailable")
         return binding
@@ -50,7 +56,10 @@ def _windows_session_id(process_id: int) -> str:
 
     session_id = wintypes.DWORD()
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.ProcessIdToSessionId.argtypes = [
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
     kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
     if not kernel32.ProcessIdToSessionId(process_id, ctypes.byref(session_id)):
         raise RuntimeBindingUnavailable("Windows session id is unavailable")
@@ -71,27 +80,71 @@ def _windows_user_sid() -> str:
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.LPWSTR),
+    ]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+
     token = wintypes.HANDLE()
-    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)):
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(),
+        token_query,
+        ctypes.byref(token),
+    ):
         raise RuntimeBindingUnavailable("Windows user token is unavailable")
     try:
         required = wintypes.DWORD()
-        advapi32.GetTokenInformation(token, token_user_class, None, 0, ctypes.byref(required))
+        advapi32.GetTokenInformation(
+            token,
+            token_user_class,
+            None,
+            0,
+            ctypes.byref(required),
+        )
         if required.value == 0:
             raise RuntimeBindingUnavailable("Windows user SID is unavailable")
         buffer = ctypes.create_string_buffer(required.value)
         if not advapi32.GetTokenInformation(
-            token, token_user_class, buffer, required, ctypes.byref(required)
+            token,
+            token_user_class,
+            buffer,
+            required,
+            ctypes.byref(required),
         ):
             raise RuntimeBindingUnavailable("Windows user SID is unavailable")
         token_user = ctypes.cast(buffer, ctypes.POINTER(TokenUser)).contents
         sid_text = wintypes.LPWSTR()
-        if not advapi32.ConvertSidToStringSidW(token_user.user.sid, ctypes.byref(sid_text)):
+        if not advapi32.ConvertSidToStringSidW(
+            token_user.user.sid,
+            ctypes.byref(sid_text),
+        ):
             raise RuntimeBindingUnavailable("Windows user SID is unavailable")
         try:
             value = sid_text.value or ""
         finally:
-            kernel32.LocalFree(sid_text)
+            kernel32.LocalFree(ctypes.cast(sid_text, wintypes.HLOCAL))
         if not value:
             raise RuntimeBindingUnavailable("Windows user SID is unavailable")
         return value
