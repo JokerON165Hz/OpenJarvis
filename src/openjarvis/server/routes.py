@@ -60,23 +60,34 @@ def _ensure_identity_prompt(messages: list[Message], app_config) -> list[Message
     If any message already carries a system role, the caller has supplied
     their own grounding and we leave the list untouched (no double-prompting).
 
-    Resolution of the identity text: ``app_config.agent.default_system_prompt``
-    when a config is wired onto ``app.state``; otherwise fall back to
-    ``load_config()``. Config resolution is wrapped so a broken/missing
-    config degrades to "no injection" rather than crashing the endpoint, but
-    the failure is logged (per REVIEW.md — never silently swallow).
+    Resolution of the identity text: the config comes from ``app.state`` when
+    wired, otherwise ``load_config()``; the prompt itself is assembled by
+    ``SystemPromptBuilder`` from ``agent.default_system_prompt`` plus the
+    persona files (SOUL.md/MEMORY.md/USER.md), matching
+    ``_build_managed_system_prompt`` in ``agent_manager_routes.py``. Config
+    resolution is wrapped so a broken/missing config degrades to "no
+    injection" rather than crashing the endpoint, but the failure is logged
+    (per REVIEW.md — never silently swallow).
     """
     if any(m.role == Role.SYSTEM for m in messages):
         return messages
 
     prompt = ""
     try:
-        if app_config is not None:
-            prompt = app_config.agent.default_system_prompt or ""
-        else:
+        cfg = app_config
+        if cfg is None:
             from openjarvis.core.config import load_config
 
-            prompt = load_config().agent.default_system_prompt or ""
+            cfg = load_config()
+
+        from openjarvis.prompt.builder import SystemPromptBuilder
+
+        builder = SystemPromptBuilder(
+            agent_template=cfg.agent.default_system_prompt or "",
+            memory_files_config=getattr(cfg, "memory_files", None),
+            system_prompt_config=getattr(cfg, "system_prompt", None),
+        )
+        prompt = builder.build()
     except Exception:
         logging.getLogger("openjarvis.server").debug(
             "Identity system prompt resolution failed; "
@@ -245,8 +256,14 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 "ToolActionService owns policy, approval, and verification."
             ),
         )
+
+    # ``_handle_agent`` (sync ``agent.run()``) and ``_handle_direct`` (sync
+    # ``engine.generate()``) both make blocking upstream calls; run them in a
+    # worker thread so a slow/wedged non-streaming request can't stall the
+    # event loop and every other concurrent request with it.
     if agent is not None and not request_body.tools:
-        response = _handle_agent(
+        response = await asyncio.to_thread(
+            _handle_agent,
             agent,
             model,
             request_body,
@@ -256,7 +273,8 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         )
     else:
         bus = getattr(request.app.state, "bus", None)
-        response = _handle_direct(
+        response = await asyncio.to_thread(
+            _handle_direct,
             engine,
             model,
             request_body,
@@ -850,7 +868,7 @@ async def list_models(request: Request) -> ModelListResponse:
     # Filter out any cloud model IDs that may appear via MultiEngine.
     # Fall back to direct Ollama query only when the engine returns nothing.
     engine = request.app.state.engine
-    all_ids = engine.list_models()
+    all_ids = await asyncio.to_thread(engine.list_models)
     model_ids = [m for m in all_ids if not is_cloud_model(m)]
     if not model_ids:
         model_ids = await list_local_models()
@@ -880,12 +898,12 @@ async def pull_model(request: Request):
     import httpx as _httpx
 
     host = getattr(engine, "_host", "http://localhost:11434")
-    client = _httpx.Client(base_url=host, timeout=600.0)
     try:
-        resp = client.post(
-            "/api/pull",
-            json={"name": model_name, "stream": False},
-        )
+        async with _httpx.AsyncClient(base_url=host, timeout=600.0) as client:
+            resp = await client.post(
+                "/api/pull",
+                json={"name": model_name, "stream": False},
+            )
         resp.raise_for_status()
     except (_httpx.ConnectError, _httpx.TimeoutException) as exc:
         raise HTTPException(status_code=502, detail=f"Ollama unreachable: {exc}")
@@ -894,8 +912,6 @@ async def pull_model(request: Request):
             status_code=exc.response.status_code,
             detail=f"Ollama error: {exc.response.text[:300]}",
         )
-    finally:
-        client.close()
 
     return {"status": "ok", "model": model_name}
 
@@ -911,13 +927,13 @@ async def delete_model(model_name: str, request: Request):
     import httpx as _httpx
 
     host = getattr(engine, "_host", "http://localhost:11434")
-    client = _httpx.Client(base_url=host, timeout=30.0)
     try:
-        resp = client.request(
-            "DELETE",
-            "/api/delete",
-            json={"name": model_name},
-        )
+        async with _httpx.AsyncClient(base_url=host, timeout=30.0) as client:
+            resp = await client.request(
+                "DELETE",
+                "/api/delete",
+                json={"name": model_name},
+            )
         resp.raise_for_status()
     except (_httpx.ConnectError, _httpx.TimeoutException) as exc:
         raise HTTPException(status_code=502, detail=f"Ollama unreachable: {exc}")
@@ -926,8 +942,6 @@ async def delete_model(model_name: str, request: Request):
             status_code=exc.response.status_code,
             detail=f"Ollama error: {exc.response.text[:300]}",
         )
-    finally:
-        client.close()
 
     return {"status": "deleted", "model": model_name}
 

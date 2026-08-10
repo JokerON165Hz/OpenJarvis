@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // authHeaders) that source the key and build the header.
 
 const SETTINGS_KEY = 'openjarvis-settings';
+const fetchMock = vi.fn<typeof fetch>();
 
 // Minimal in-memory localStorage stub so the helpers can run under node
 // (no jsdom dependency).
@@ -28,6 +29,8 @@ class MemoryStorage {
 beforeEach(() => {
   vi.resetModules();
   vi.stubEnv('VITE_SUPABASE_ANON_KEY', 'test-anon-key');
+  fetchMock.mockReset();
+  globalThis.fetch = fetchMock;
   (globalThis as unknown as { localStorage: MemoryStorage }).localStorage =
     new MemoryStorage();
 });
@@ -135,6 +138,53 @@ describe('final desktop API base', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       '/v1/tasks/task-test/summary',
       expect.objectContaining({ cache: 'no-store' }),
+    );
+  });
+});
+
+describe('tool credentials', () => {
+  it('reads credential status from the local server', async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ TAVILY_API_KEY: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const { fetchToolCredentialStatus } = await freshApi();
+
+    await expect(fetchToolCredentialStatus('web_search')).resolves.toEqual({
+      TAVILY_API_KEY: true,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/v1/tools/web_search/credentials/status',
+      { headers: {} },
+    );
+  });
+
+  it('saves a tool credential through the local server', async () => {
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
+    const { saveToolCredentials } = await freshApi();
+
+    await saveToolCredentials('web_search', {
+      TAVILY_API_KEY: 'tvly-test',
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith('/v1/tools/web_search/credentials', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ TAVILY_API_KEY: 'tvly-test' }),
+    });
+  });
+
+  it('deletes a tool credential through the local server', async () => {
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
+    const { deleteToolCredential } = await freshApi();
+
+    await deleteToolCredential('web_search', 'TAVILY_API_KEY');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/v1/tools/web_search/credentials/TAVILY_API_KEY',
+      { method: 'DELETE', headers: {} },
     );
   });
 });

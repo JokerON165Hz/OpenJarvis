@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import List, Optional
@@ -114,26 +115,31 @@ class FasterWhisperBackend(SpeechBackend):
         try:
             model = self._ensure_model()
 
-            # Faster Whisper opens the path itself. The first handle must be
-            # closed beforehand because Windows otherwise denies the decoder
-            # access to a NamedTemporaryFile that is still open.
+            # Write audio to a temp file (faster-whisper needs a file path).
+            # delete=False + manual unlink: on Windows an open
+            # NamedTemporaryFile holds an exclusive handle, so PyAV's reopen
+            # of tmp.name inside model.transcribe() fails with EACCES.
             suffix = f".{format}" if not format.startswith(".") else format
-            temp_path: Path | None = None
+            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
             try:
-                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                    temp_path = Path(tmp.name)
+                with tmp:
                     tmp.write(audio)
-                    tmp.flush()
 
                 kwargs = {}
                 if language:
                     kwargs["language"] = language
 
-                segments_iter, info = model.transcribe(str(temp_path), **kwargs)
+                segments_iter, info = model.transcribe(tmp.name, **kwargs)
                 segments_list = list(segments_iter)
             finally:
-                if temp_path is not None:
-                    temp_path.unlink(missing_ok=True)
+                try:
+                    os.unlink(tmp.name)
+                except OSError as unlink_exc:
+                    logger.debug(
+                        "Could not remove temp audio file %s: %s",
+                        tmp.name,
+                        unlink_exc,
+                    )
         except Exception as exc:
             self._last_error = str(exc)
             raise
