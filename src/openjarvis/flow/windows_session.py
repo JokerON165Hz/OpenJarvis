@@ -1,4 +1,4 @@
-"""Native Windows session boundary for owner-authenticated Flow sessions."""
+"""Native Windows desktop/session boundary for active Flow grants."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ class WindowsSessionLockMonitor:
     def start(self) -> None:
         if os.name != "nt" or self._thread is not None:
             return
+        self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
             name="openjarvis-windows-session-monitor",
@@ -46,7 +47,7 @@ class WindowsSessionLockMonitor:
             self.check_once()
 
     def check_once(self) -> None:
-        """Evaluate the native session boundary once (also used by tests)."""
+        """Evaluate the native desktop boundary once (also used by tests)."""
 
         if not self._is_flow():
             return
