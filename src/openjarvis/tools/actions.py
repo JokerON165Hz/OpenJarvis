@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
@@ -15,6 +16,13 @@ from openjarvis.tools.manifest import SideEffectClass
 
 def _id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def stable_action_id(task_id: str, idempotency_key: str) -> str:
+    """Return the same action id for the same task-scoped idempotency key."""
+
+    digest = hashlib.sha256(f"{task_id}\0{idempotency_key}".encode("utf-8")).hexdigest()
+    return f"action_{digest[:32]}"
 
 
 def utc_now() -> str:
@@ -41,6 +49,7 @@ class ActionStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELED = "canceled"
+    RECOVERY_REQUIRED = "recovery_required"
 
 
 class VerificationStatus(str, Enum):
@@ -110,6 +119,9 @@ class ToolAction(BaseModel):
     tool_run_id: str | None = None
     tool_id: str = Field(min_length=1)
     manifest_version: str = Field(min_length=1)
+    # Empty is accepted only for legacy records. The executor refuses to run a
+    # legacy action until it is recreated against a trusted manifest snapshot.
+    manifest_fingerprint: str = Field(default="", pattern=r"^$|^[0-9a-f]{64}$")
     capability: str = Field(min_length=1)
     risk_level: RiskLevel
     target: str = Field(min_length=1)
@@ -133,8 +145,10 @@ class ToolAction(BaseModel):
         *,
         manifest_version: str,
         effective_risk: RiskLevel,
+        manifest_fingerprint: str = "",
     ) -> "ToolAction":
         return cls(
+            action_id=stable_action_id(proposal.task_id, proposal.idempotency_key),
             proposal_id=proposal.proposal_id,
             task_id=proposal.task_id,
             session_id=proposal.session_id,
@@ -144,6 +158,7 @@ class ToolAction(BaseModel):
             item_id=proposal.item_id,
             tool_id=proposal.tool_id,
             manifest_version=manifest_version,
+            manifest_fingerprint=manifest_fingerprint,
             capability=proposal.capability,
             risk_level=effective_risk,
             target=proposal.target,
@@ -203,6 +218,7 @@ TOOL_EVENT_TYPES = frozenset(
         "tool.completed",
         "tool.failed",
         "tool.canceled",
+        "tool.recovery_required",
         "tool.undo_prepared",
         "tool.undo_applied",
         "browser.health_checked",
@@ -253,5 +269,6 @@ __all__ = [
     "ToolProposal",
     "VerificationResult",
     "VerificationStatus",
+    "stable_action_id",
     "utc_now",
 ]
