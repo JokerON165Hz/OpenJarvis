@@ -235,17 +235,21 @@ class BrowserProcessManager:
         self.command_builder = command_builder or self._chromium_command
         self.control_restart = control_restart
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
+        self._owned_sessions: set[str] = set()
 
     def create_session(self) -> BrowserSession:
         session = BrowserSession(
             profile_path=Path(), control_port=_reserve_loopback_port()
         )
         session.profile_path = self.profile_policy.create(session.session_id)
+        self._owned_sessions.add(session.session_id)
         return session
 
     def start(
         self, session: BrowserSession, *, timeout: float = 15.0
     ) -> BrowserSession:
+        if session.session_id not in self._owned_sessions:
+            raise BrowserOpenError("browser session is not owned by this manager")
         existing = self._processes.get(session.session_id)
         if existing is not None and existing.poll() is None:
             session.browser_pid = existing.pid
@@ -358,6 +362,8 @@ class BrowserProcessManager:
         return bool(self.control_restart(session))
 
     def close(self, session: BrowserSession, *, remove_profile: bool = True) -> None:
+        if session.session_id not in self._owned_sessions:
+            raise BrowserOpenError("browser session is not owned by this manager")
         process = self._processes.pop(session.session_id, None)
         if process is not None and process.poll() is None:
             _terminate_owned_tree(process)
@@ -366,6 +372,8 @@ class BrowserProcessManager:
         session.control_service_pid = None
         if remove_profile and session.profile_path.exists():
             self.profile_policy.remove(session.profile_path, session.session_id)
+        if remove_profile:
+            self._owned_sessions.discard(session.session_id)
 
     def cancel_owned(self, session: BrowserSession) -> None:
         self.close(session)

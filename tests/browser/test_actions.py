@@ -91,6 +91,41 @@ def test_navigation_is_loopback_only_and_verified(browser) -> None:
     assert result.observation.ready_state == "complete"
 
 
+def test_navigation_redirect_is_verified_from_final_url(browser) -> None:
+    adapter, control, _ = browser
+
+    def redirect(_url):
+        control.observation = BrowserObservation(
+            "http://127.0.0.1:8765/final",
+            "Synthetic",
+            "complete",
+            "Ready",
+        )
+        return control.observation
+
+    control.navigate = redirect
+    result = adapter.navigate("http://127.0.0.1:8765/start")
+    assert result.verified is True
+    assert result.observation.url.endswith("/final")
+    assert "redirect" in result.verification
+
+
+def test_navigation_redirect_rechecks_network_policy(browser) -> None:
+    adapter, control, _ = browser
+
+    def redirect(_url):
+        return BrowserObservation(
+            "http://127.0.0.1:9999/private",
+            "Synthetic",
+            "complete",
+            "Ready",
+        )
+
+    control.navigate = redirect
+    with pytest.raises(BrowserPolicyError, match="allowlisted"):
+        adapter.navigate("http://127.0.0.1:8765/start")
+
+
 def test_public_research_policy_allows_only_public_https(monkeypatch) -> None:
     policy = PublicBrowserNetworkPolicy()
 

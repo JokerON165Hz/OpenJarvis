@@ -14,7 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from openjarvis.browser.cdp import BrowserObservation
+from openjarvis.browser.cdp import (
+    BrowserControlError,
+    BrowserObservation,
+    normalize_url,
+)
 from openjarvis.browser.models import BrowserSession
 from openjarvis.security.file_policy import is_sensitive_file
 from openjarvis.tasks.policy import RiskLevel
@@ -243,15 +247,18 @@ class BrowserActionVerifier:
         expected_url: str,
         expected_title: str | None = None,
     ) -> str:
-        if observation.url != expected_url:
-            raise BrowserPolicyError(
-                f"navigation URL mismatch: {observation.url!r} != {expected_url!r}"
-            )
+        try:
+            expected = normalize_url(expected_url)
+            final = normalize_url(observation.url)
+        except BrowserControlError as exc:
+            raise BrowserPolicyError("navigation produced an invalid final URL") from exc
         if observation.ready_state not in {"interactive", "complete"}:
             raise BrowserPolicyError("document is not ready")
         if expected_title is not None and observation.title != expected_title:
             raise BrowserPolicyError("navigation title mismatch")
-        return "URL, document state, and title were observed"
+        if final == expected:
+            return "normalized URL, document state, and title were observed"
+        return f"redirect to final URL was observed: {final}"
 
     @staticmethod
     def click(
@@ -310,11 +317,16 @@ class BrowserToolAdapter:
     ) -> BrowserActionResult:
         target = self.network.validate(url)
         self.session.safe_checkpoint = "before.navigation"
+        self.session.effect_known = False
         observation = self.control.navigate(target)
+        # Redirect destinations cross the same network policy boundary as the
+        # originally requested URL and must be evaluated independently.
+        self.network.validate(observation.url)
         verification = self.verifier.navigation(
             observation, expected_url=target, expected_title=expected_title
         )
         assessment = self.injection.scan(observation.text)
+        self.session.effect_known = True
         self.session.safe_checkpoint = "after.navigation.verified"
         return BrowserActionResult(True, observation, verification, assessment)
 

@@ -26,7 +26,7 @@ class BrowserHealthManager(Protocol):
 
 
 class BrowserRecoveryController:
-    """Exactly one reconnect and at most one control-service restart."""
+    """Bounded reconnect, optional control restart, and mandatory rebind."""
 
     def __init__(
         self,
@@ -114,9 +114,15 @@ class BrowserRecoveryController:
             session.control_restart_attempts += 1
             restart_attempted = True
             restart_succeeded = bool(self.manager.restart_control_service(session))
+        rebound_after_restart = False
+        if restart_succeeded:
+            # A healthy HTTP endpoint is insufficient: commands still use the
+            # old websocket until the adapter binds to the same target again.
+            session.reconnect_attempts += 1
+            rebound_after_restart = bool(self.adapter.reconnect(session))
         final = self.manager.health(session)
         self.event_sink("browser.health_checked", _health_payload(final))
-        if restart_succeeded and final.healthy:
+        if restart_succeeded and rebound_after_restart and final.healthy:
             session.status = BrowserSessionStatus.READY
             result = "control_service_restarted"
             self.event_sink(
@@ -143,7 +149,7 @@ class BrowserRecoveryController:
             maximum_attempts=session.maximum_recovery_attempts,
             cause=initial.cause,
             reconnect_attempted=True,
-            reconnect_succeeded=reconnect_succeeded,
+            reconnect_succeeded=reconnect_succeeded or rebound_after_restart,
             control_restart_attempted=restart_attempted,
             control_restart_succeeded=restart_succeeded,
             result=result,
