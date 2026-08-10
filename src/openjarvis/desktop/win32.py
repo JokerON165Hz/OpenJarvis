@@ -6,6 +6,7 @@ import ctypes
 import hashlib
 import os
 import struct
+import time
 from ctypes import wintypes
 
 from openjarvis.desktop.models import (
@@ -15,6 +16,7 @@ from openjarvis.desktop.models import (
     DesktopWindow,
     DisplayContext,
 )
+from openjarvis.desktop.safety import WindowBounds, WindowIdentity, WindowSnapshot
 from openjarvis.desktop.uia import UIAutomationError, WindowsUIAutomationBridge
 
 _DPI_AWARENESS_CONFIGURED = False
@@ -70,6 +72,12 @@ def _configure_win32() -> tuple[object, object]:
     user32.SetForegroundWindow.restype = wintypes.BOOL
     user32.GetForegroundWindow.argtypes = []
     user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetLastActivePopup.argtypes = [wintypes.HWND]
+    user32.GetLastActivePopup.restype = wintypes.HWND
+    user32.IsWindowEnabled.argtypes = [wintypes.HWND]
+    user32.IsWindowEnabled.restype = wintypes.BOOL
+    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.MonitorFromWindow.restype = wintypes.HMONITOR
     user32.IsWindow.argtypes = [wintypes.HWND]
     user32.IsWindow.restype = wintypes.BOOL
     user32.IsIconic.argtypes = [wintypes.HWND]
@@ -187,6 +195,23 @@ def _configure_win32() -> tuple[object, object]:
         ctypes.POINTER(wintypes.DWORD),
     ]
     kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.ProcessIdToSessionId.argtypes = [
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
     kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
@@ -237,6 +262,13 @@ def _pid(hwnd: int) -> int:
     return int(value.value)
 
 
+def _class_name(hwnd: int) -> str:
+    _configure_win32()
+    value = ctypes.create_unicode_buffer(256)
+    ctypes.windll.user32.GetClassNameW(hwnd, value, len(value))
+    return value.value.casefold()
+
+
 class _MonitorInfoExW(ctypes.Structure):
     _fields_ = [
         ("cbSize", wintypes.DWORD),
@@ -258,6 +290,131 @@ class Win32SemanticBackend:
 
     def semantic_status(self) -> str:
         return self._semantic_backend
+
+    @staticmethod
+    def now() -> float:
+        return time.monotonic()
+
+    @staticmethod
+    def process_started_at(process_id: int) -> int:
+        """Return the kernel process creation timestamp used to reject PID reuse."""
+
+        _require_windows()
+        _configure_win32()
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, process_id)
+        if not handle:
+            raise WindowsDesktopError("desktop process start time is unavailable")
+        try:
+            created = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                raise WindowsDesktopError("desktop process start time query failed")
+            return (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    @staticmethod
+    def process_session_id(process_id: int) -> int:
+        _require_windows()
+        _configure_win32()
+        session_id = wintypes.DWORD()
+        if not ctypes.windll.kernel32.ProcessIdToSessionId(
+            process_id, ctypes.byref(session_id)
+        ):
+            raise WindowsDesktopError("desktop process session is unavailable")
+        return int(session_id.value)
+
+    def terminate_owned_process(self, process_id: int, started_at: int) -> None:
+        """Terminate only when PID and kernel creation time still identify the owner."""
+
+        try:
+            current_started_at = self.process_started_at(process_id)
+        except WindowsDesktopError:
+            return
+        if current_started_at != started_at:
+            return
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x0001 | 0x00100000, False, process_id)
+        if not handle:
+            return
+        try:
+            if not kernel32.TerminateProcess(handle, 1):
+                raise WindowsDesktopError("owned desktop process termination failed")
+            kernel32.WaitForSingleObject(handle, 5000)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def monitor_id(self, window: DesktopWindow) -> str:
+        self._assert_owned(window.handle, window.process_id)
+        user32, _ = _configure_win32()
+        handle = int(user32.MonitorFromWindow(window.handle, 2))
+        return next(
+            (monitor.device for monitor in self.monitors() if monitor.handle == handle),
+            f"monitor:{handle}",
+        )
+
+    @staticmethod
+    def window_exists(window: DesktopWindow) -> bool:
+        _configure_win32()
+        return bool(
+            ctypes.windll.user32.IsWindow(window.handle)
+            and _pid(window.handle) == window.process_id
+        )
+
+    @staticmethod
+    def is_modal_blocked(window: DesktopWindow) -> bool:
+        user32, _ = _configure_win32()
+        popup = int(user32.GetLastActivePopup(window.handle))
+        return bool(
+            popup
+            and popup != window.handle
+            and user32.IsWindowVisible(popup)
+            and user32.IsWindowEnabled(popup)
+        )
+
+    def snapshot(self, hwnd: int) -> WindowSnapshot:
+        """Capture the complete identity/display/focus context for the guard."""
+
+        _require_windows()
+        user32, _ = _configure_win32()
+        if not user32.IsWindow(hwnd):
+            raise WindowsDesktopError("desktop window was closed")
+        process_id = _pid(hwnd)
+        dpi = int(getattr(user32, "GetDpiForWindow", lambda _h: 96)(hwnd)) or 96
+        window = DesktopWindow(hwnd, process_id, _text(hwnd), _rect(hwnd), dpi)
+        desktop_name = self.input_desktop_name()
+        bounds = window.bounds
+        return WindowSnapshot(
+            identity=WindowIdentity(
+                hwnd=hwnd,
+                pid=process_id,
+                process_started_at=self.process_started_at(process_id),
+                executable=self.process_executable(process_id),
+                title=window.title,
+                session_id=self.process_session_id(process_id),
+            ),
+            bounds=WindowBounds(
+                bounds.left,
+                bounds.top,
+                bounds.right,
+                bounds.bottom,
+            ),
+            dpi=dpi,
+            monitor_id=self.monitor_id(window),
+            focused=int(user32.GetForegroundWindow()) == hwnd,
+            modal=self.is_modal_blocked(window),
+            secure_desktop=desktop_name not in {"", "Default"},
+            locked_session=desktop_name == "",
+        )
 
     def find_window(self, process_id: int, expected_title: str) -> DesktopWindow:
         _require_windows()
@@ -461,14 +618,24 @@ class Win32SemanticBackend:
                     )
                 except (KeyError, TypeError, ValueError):
                     continue
-                digest = (
-                    int.from_bytes(
-                        hashlib.sha256(runtime_id.encode("utf-8")).digest()[:4],
-                        "big",
+                automation_identifier = str(
+                    raw.get("automation_identifier") or ""
+                ).strip()
+                native_handle = int(raw.get("native_handle") or 0)
+                semantic_id = 0
+                if automation_identifier.isdecimal():
+                    semantic_id = int(automation_identifier)
+                elif native_handle:
+                    semantic_id = int(ctypes.windll.user32.GetDlgCtrlID(native_handle))
+                if semantic_id <= 0:
+                    digest = (
+                        int.from_bytes(
+                            hashlib.sha256(runtime_id.encode("utf-8")).digest()[:4],
+                            "big",
+                        )
+                        & 0x7FFFFFFF
                     )
-                    & 0x7FFFFFFF
-                )
-                semantic_id = -(digest or 1)
+                    semantic_id = -(digest or 1)
                 while (
                     window.handle,
                     semantic_id,
@@ -481,11 +648,20 @@ class Win32SemanticBackend:
                 protected = bool(raw.get("is_password"))
                 if protected:
                     self._uia_password_ids.add(key)
+                role = str(raw.get("role") or "custom").casefold()[:80]
+                if native_handle and role in {"custom", "pane"}:
+                    native_role = _class_name(native_handle)
+                    if native_role in {"button", "edit", "static"}:
+                        role = native_role
+                        # Generic UIA panes expose no reliable action pattern;
+                        # retain their stable IDs but use the native semantic
+                        # message path for these standard Win32 controls.
+                        self._uia_runtime_ids.pop(key, None)
                 converted.append(
                     DesktopElement(
-                        handle=int(raw.get("native_handle") or 0),
+                        handle=native_handle,
                         process_id=window.process_id,
-                        role=str(raw.get("role") or "custom").casefold()[:80],
+                        role=role,
                         name=str(raw.get("name") or "")[:512],
                         automation_id=semantic_id,
                         bounds=rect,
@@ -503,13 +679,11 @@ class Win32SemanticBackend:
         )
 
         def callback(hwnd, _lparam):
-            class_name = ctypes.create_unicode_buffer(256)
-            ctypes.windll.user32.GetClassNameW(hwnd, class_name, len(class_name))
             children.append(
                 DesktopElement(
                     handle=int(hwnd),
                     process_id=window.process_id,
-                    role=class_name.value.casefold(),
+                    role=_class_name(hwnd),
                     name=_text(hwnd),
                     automation_id=int(ctypes.windll.user32.GetDlgCtrlID(hwnd)),
                     bounds=_rect(hwnd),

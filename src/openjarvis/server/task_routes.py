@@ -166,6 +166,20 @@ def _orchestrator(request: Request):
     return orchestrator
 
 
+def _begin_task_action_lease(flow_authority, task_id: str):
+    """Mint authority only from the active trusted Flow/task binding."""
+
+    if not flow_authority.is_flow():
+        return None
+    status = flow_authority.status()
+    if not status.session_id:
+        raise PermissionError("Flow session binding is unavailable")
+    return flow_authority.begin_action(
+        session_id=status.session_id,
+        task_context=task_id,
+    )
+
+
 def _workspace_path(value: str | None, *, fallback: Path | None = None) -> Path:
     path = Path(value).expanduser() if value else (fallback or Path.cwd())
     path = path.resolve(strict=False)
@@ -434,16 +448,9 @@ def _recover_chat_task_after_backend_error(
     """
 
     current = service.get(task_id)
-    if current is None or current.status is not TaskStatus.FAILED:
+    if current is None or current.status is not TaskStatus.RECOVERING:
         return
     try:
-        service.transition(
-            task_id,
-            TaskStatus.RECOVERING,
-            component="jarvis_chat_api",
-            cause="chat_turn_failure_recoverable",
-            idempotency_key=f"chat:{request_id}:recovering",
-        )
         service.transition(
             task_id,
             TaskStatus.RUNNING,
@@ -465,6 +472,7 @@ async def _execute_canonical_tool_proposal(
     request_id: str,
     step: int,
     parameter_source,
+    action_lease=None,
 ):
     from openjarvis.tools.actions import ActionStatus, ToolProposal
 
@@ -501,9 +509,20 @@ async def _execute_canonical_tool_proposal(
         rationale="The assistant proposed one tool for the current explicit user task.",
         parameter_sources={key: parameter_source for key in arguments},
     )
-    action = action_service.create(proposal)
+    action = (
+        action_service.create(proposal, action_lease=action_lease)
+        if action_lease is not None
+        else action_service.create(proposal)
+    )
     if action.status in {ActionStatus.VALIDATED, ActionStatus.WAITING_APPROVAL}:
-        action = await action_service.execute(action.action_id)
+        action = await (
+            action_service.execute(
+                action.action_id,
+                action_lease=action_lease,
+            )
+            if action_lease is not None
+            else action_service.execute(action.action_id)
+        )
     return action
 
 
@@ -761,19 +780,30 @@ async def canonical_chat(
                 cause="flow_memory_write_started",
                 idempotency_key=f"chat:{idempotency_key}:memory-running",
             )
-        candidate = await asyncio.to_thread(
-            memory.create_candidate,
-            MemoryTaskContext(
-                task_id=task.task_id,
-                session_id=task.session_id,
-                correlation_id=task.correlation_id,
-                thread_id=task.active_thread_id,
-                turn_id=task.active_turn_id,
-            ),
-            body=explicit_memory,
-            correction=False,
-            idempotency_key=f"chat-{idempotency_key}",
-        )
+        try:
+            memory_lease = _begin_task_action_lease(
+                flow_authority,
+                task.task_id,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        try:
+            candidate = await asyncio.to_thread(
+                memory.create_candidate,
+                MemoryTaskContext(
+                    task_id=task.task_id,
+                    session_id=task.session_id,
+                    correlation_id=task.correlation_id,
+                    thread_id=task.active_thread_id,
+                    turn_id=task.active_turn_id,
+                ),
+                body=explicit_memory,
+                correction=False,
+                idempotency_key=f"chat-{idempotency_key}",
+            )
+        finally:
+            if memory_lease is not None:
+                flow_authority.end_action(memory_lease)
         response_content = f"Gespeichert: {explicit_memory}"
         _append_chat_event(
             service,
@@ -882,6 +912,10 @@ async def canonical_chat(
     developer_instructions = _canonical_tool_instructions(request, intent)
     handled_actions: list[Any] = []
     try:
+        action_lease = _begin_task_action_lease(flow_authority, task.task_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    try:
         result = await orchestrator.execute(
             task.task_id,
             prompt,
@@ -890,6 +924,7 @@ async def canonical_chat(
             developer_instructions=developer_instructions,
             turn_correlation_id=correlation_id,
             finalize_task=False,
+            action_lease=action_lease,
         )
         response_content = result.content
         from openjarvis.tools.actions import ParameterSource
@@ -921,6 +956,7 @@ async def canonical_chat(
                     request_id=idempotency_key,
                     step=step,
                     parameter_source=proposal_parameter_source,
+                    action_lease=action_lease,
                 )
             except (ValueError, RuntimeError) as exc:
                 _append_chat_event(
@@ -980,6 +1016,7 @@ async def canonical_chat(
                 developer_instructions=developer_instructions,
                 turn_correlation_id=f"{correlation_id}:tool-follow-up:{step}",
                 finalize_task=False,
+                action_lease=action_lease,
             )
             response_content = result.content
             proposal_parameter_source = ParameterSource.TOOL_OUTPUT
@@ -1001,6 +1038,9 @@ async def canonical_chat(
             request_id=idempotency_key,
         )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    finally:
+        if action_lease is not None:
+            flow_authority.end_action(action_lease)
 
     if not response_content.strip():
         status_code, detail, error_category = _missing_codex_response_error(
@@ -1025,48 +1065,109 @@ async def canonical_chat(
             detail=detail,
         )
 
-    if remember_completed_result and flow_authority.is_flow() and memory is not None:
-        try:
-            from openjarvis.memory.task_bridge import MemoryTaskContext
+    if remember_completed_result and memory is not None:
+        from openjarvis.tools.actions import ActionStatus, VerificationStatus
 
-            candidate = await asyncio.to_thread(
-                memory.create_candidate,
-                MemoryTaskContext(
+        result_actions = tuple((*pending_actions, *handled_actions))
+        verified_actions = tuple(
+            action
+            for action in result_actions
+            if action.status is ActionStatus.COMPLETED
+            and action.verification_status is VerificationStatus.PASSED
+            and getattr(action, "effect_known", False) is True
+            and bool(action.output_summary.strip())
+        )
+        if verified_actions and len(verified_actions) == len(result_actions):
+            try:
+                from openjarvis.memory.task_bridge import MemoryTaskContext
+
+                result_body = "\n\n".join(
+                    f"Verified result from {action.tool_id}:\n{action.output_summary}"
+                    for action in verified_actions
+                )
+                evidence = {
+                    "kind": "verified_tool_result",
+                    "task_id": task.task_id,
+                    "session_id": task.session_id,
+                    "correlation_id": task.correlation_id,
+                    "thread_id": result.thread_id,
+                    "turn_id": result.turn_id,
+                    "actions": [
+                        {
+                            "action_id": action.action_id,
+                            "tool_id": action.tool_id,
+                            "tool_run_id": action.tool_run_id,
+                            "correlation_id": action.correlation_id,
+                            "thread_id": action.thread_id,
+                            "turn_id": action.turn_id,
+                            "status": action.status.value,
+                            "verification_status": action.verification_status.value,
+                            "effect_known": action.effect_known,
+                        }
+                        for action in verified_actions
+                    ],
+                }
+                candidate = await asyncio.to_thread(
+                    memory.create_candidate,
+                    MemoryTaskContext(
+                        task_id=task.task_id,
+                        session_id=task.session_id,
+                        correlation_id=task.correlation_id,
+                        thread_id=result.thread_id,
+                        turn_id=result.turn_id,
+                    ),
+                    body=result_body,
+                    correction=False,
+                    source="verified_tool_result",
+                    evidence=evidence,
+                    apply_if_flow=False,
+                    idempotency_key=f"chat-result-{idempotency_key}",
+                )
+                _append_chat_event(
+                    service,
                     task_id=task.task_id,
-                    session_id=task.session_id,
-                    correlation_id=task.correlation_id,
+                    source_event_id=(
+                        f"chat:{idempotency_key}:verified-result-memory-candidate"
+                    ),
+                    event_type="memory.verified_result_candidate_created",
+                    payload={
+                        "candidate_id": candidate.candidate_id,
+                        "note_id": candidate.note_id,
+                        "path": candidate.proposed_path,
+                        "source": "verified_tool_result",
+                        "action_ids": [
+                            action.action_id for action in verified_actions
+                        ],
+                    },
                     thread_id=result.thread_id,
                     turn_id=result.turn_id,
-                ),
-                body=response_content,
-                correction=False,
-                idempotency_key=f"chat-result-{idempotency_key}",
-            )
+                )
+                response_content = (
+                    response_content.rstrip()
+                    + "\n\nIch habe das verifizierte Ergebnis als prüfbaren "
+                    "Erinnerungskandidaten vorgemerkt."
+                )
+            except Exception as exc:
+                _append_chat_event(
+                    service,
+                    task_id=task.task_id,
+                    source_event_id=f"chat:{idempotency_key}:result-memory-failed",
+                    event_type="memory.write_failed",
+                    payload={"error_category": type(exc).__name__},
+                    thread_id=result.thread_id,
+                    turn_id=result.turn_id,
+                )
+        else:
             _append_chat_event(
                 service,
                 task_id=task.task_id,
-                source_event_id=f"chat:{idempotency_key}:result-memory-applied",
-                event_type="memory.flow_write_applied",
+                source_event_id=f"chat:{idempotency_key}:result-memory-rejected",
+                event_type="memory.verified_result_candidate_rejected",
                 payload={
-                    "candidate_id": candidate.candidate_id,
-                    "note_id": candidate.note_id,
-                    "path": candidate.proposed_path,
-                    "source": "completed_assistant_result",
+                    "reason": "missing_complete_verification_evidence",
+                    "action_count": len(result_actions),
+                    "verified_action_count": len(verified_actions),
                 },
-                thread_id=result.thread_id,
-                turn_id=result.turn_id,
-            )
-            response_content = (
-                response_content.rstrip()
-                + "\n\nIch habe das Ergebnis dauerhaft gespeichert."
-            )
-        except Exception as exc:
-            _append_chat_event(
-                service,
-                task_id=task.task_id,
-                source_event_id=f"chat:{idempotency_key}:result-memory-failed",
-                event_type="memory.write_failed",
-                payload={"error_category": type(exc).__name__},
                 thread_id=result.thread_id,
                 turn_id=result.turn_id,
             )
@@ -1442,6 +1543,13 @@ async def resume_task(
             "idempotent_replay": True,
         }
     service.project_committed(event)
+    flow_authority = getattr(request.app.state, "flow_authority", None)
+    action_lease = None
+    if flow_authority is not None:
+        try:
+            action_lease = _begin_task_action_lease(flow_authority, task.task_id)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
     try:
         result = await _orchestrator(request).execute(
             task_id,
@@ -1450,11 +1558,15 @@ async def resume_task(
             isolated_workspace=isolated,
             turn_correlation_id=correlation_id,
             finalize_task=body.finalize_task,
+            action_lease=action_lease,
         )
     except (ValueError, InvalidTaskTransition) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except CodexBackendError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    finally:
+        if action_lease is not None:
+            flow_authority.end_action(action_lease)
     return {
         "task": serialize_task(result.task),
         "content": result.content,

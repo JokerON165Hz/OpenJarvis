@@ -279,6 +279,101 @@ async def test_crash_after_effect_requires_recovery_without_reexecution(
 
 
 @pytest.mark.asyncio
+async def test_startup_recovery_marks_every_inflight_effect_without_reexecution(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(
+        side_effect=SideEffectClass.EXTERNAL_WRITE,
+        risk=RiskLevel.DESTRUCTIVE_OR_SENSITIVE,
+        idempotency=IdempotencyPolicy.NEVER_AFTER_UNKNOWN_EFFECT,
+        retries=0,
+    )
+    db_path = tmp_path / "actions.db"
+    calls = 0
+
+    def handler(arguments):
+        nonlocal calls
+        calls += 1
+        return arguments
+
+    crashed, crashed_store, _, _ = _service(
+        db_path,
+        tmp_path / "artifacts-1",
+        manifest,
+        handler=handler,
+    )
+    action = crashed.create(_proposal(manifest))
+
+    def crash(*_args, **_kwargs):
+        raise SystemExit("simulated crash before state commit")
+
+    crashed._store_output = crash
+    with pytest.raises(SystemExit):
+        await crashed.execute(action.action_id)
+    crashed_store.close()
+
+    restarted, restarted_store, _, _ = _service(
+        db_path,
+        tmp_path / "artifacts-2",
+        manifest,
+        handler=handler,
+    )
+    recovered = restarted.recover_incomplete()
+
+    assert [item.action_id for item in recovered] == [action.action_id]
+    assert recovered[0].status is ActionStatus.RECOVERY_REQUIRED
+    assert recovered[0].effect_known is False
+    assert restarted.recover_incomplete() == ()
+    assert calls == 1
+    restarted_store.close()
+
+
+@pytest.mark.asyncio
+async def test_global_stop_cancels_inflight_action_and_blocks_late_revival(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(
+        side_effect=SideEffectClass.EXTERNAL_WRITE,
+        risk=RiskLevel.DESTRUCTIVE_OR_SENSITIVE,
+        idempotency=IdempotencyPolicy.NEVER_AFTER_UNKNOWN_EFFECT,
+        retries=0,
+    )
+    entered = threading.Event()
+    released = threading.Event()
+    interrupted = threading.Event()
+
+    def handler(arguments):
+        entered.set()
+        released.wait(timeout=2)
+        return arguments
+
+    service, store, _, _ = _service(
+        tmp_path / "actions.db",
+        tmp_path / "artifacts",
+        manifest,
+        handler=handler,
+        interrupt=interrupted.set,
+    )
+    action = service.create(_proposal(manifest))
+    execution = asyncio.create_task(service.execute(action.action_id))
+    assert await asyncio.to_thread(entered.wait, 1)
+
+    stopped = service.global_stop()
+    released.set()
+    result = await execution
+
+    assert stopped[0].status is ActionStatus.CANCELED
+    assert stopped[0].effect_known is False
+    assert interrupted.is_set()
+    assert result.status is ActionStatus.CANCELED
+    assert store.get_action(action.action_id).status is ActionStatus.CANCELED
+    assert "tool.completed" not in {
+        event.event_type for event in store.list_events(action.action_id)
+    }
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_external_postcondition_is_recovery_not_success(
     tmp_path: Path,
 ) -> None:

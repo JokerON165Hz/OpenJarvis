@@ -117,7 +117,13 @@ class FlowActivationChallenge:
     expires_at: int
     bridge_generation: int
 
-    def assertion_message(self, *, nonce: str, authenticated_at: int) -> bytes:
+    def assertion_message(
+        self,
+        *,
+        nonce: str,
+        authenticated_at: int,
+        owner_verification: str = "verified",
+    ) -> bytes:
         payload = {
             "authenticated_at": authenticated_at,
             "bridge_generation": self.bridge_generation,
@@ -127,6 +133,7 @@ class FlowActivationChallenge:
             "nonce": nonce,
             "os_session_id": self.os_session_id,
             "owner": self.owner,
+            "owner_verification": owner_verification,
             "process_id": self.process_id,
             "process_nonce": self.process_nonce,
             "task_context_digest": self.task_context_digest,
@@ -141,6 +148,7 @@ class NativeFlowAssertion:
     nonce: str
     authenticated_at: int
     signature: str = field(repr=False)
+    owner_verification: str = "verified"
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,11 +187,13 @@ class FlowSessionAuthority:
         bridge_secret_max_age_seconds: int = BRIDGE_SECRET_MAX_AGE_SECONDS,
         owner_verifier: UserConsentVerifier | None = None,
         binding_provider: RuntimeBindingProvider | None = None,
+        trust_native_owner_verification: bool = False,
     ) -> None:
         self._clock = clock
         self._max_session_seconds = max_session_seconds
         self._bridge_secret_max_age_seconds = bridge_secret_max_age_seconds
         self._owner_verifier = owner_verifier or FailClosedUserConsentVerifier()
+        self._trust_native_owner_verification = trust_native_owner_verification
         self._binding_provider = binding_provider or LocalRuntimeBindingProvider()
         self._lock = threading.RLock()
         self._global_stop = threading.Event()
@@ -245,6 +255,8 @@ class FlowSessionAuthority:
 
     def activate_assistant(self) -> FlowStatus:
         with self._lock:
+            if self._global_stop.is_set():
+                raise FlowAuthenticationError("global stop is active")
             if self._mode is AccessMode.FLOW:
                 self._clear_flow("assistant_selected", destroy_bridge=True)
             else:
@@ -307,11 +319,16 @@ class FlowSessionAuthority:
             binding = self._current_binding()
             self._consume_pending_activation()
 
-        try:
-            verification = self._owner_verifier.verify(prompt=FLOW_VERIFICATION_PROMPT)
-            verification_status = verification.status
-        except Exception:
-            verification_status = OwnerVerificationStatus.FAILED
+        if self._trust_native_owner_verification:
+            verification_status = OwnerVerificationStatus.VERIFIED
+        else:
+            try:
+                verification = self._owner_verifier.verify(
+                    prompt=FLOW_VERIFICATION_PROMPT
+                )
+                verification_status = verification.status
+            except Exception:
+                verification_status = OwnerVerificationStatus.FAILED
 
         with self._lock:
             if self._global_stop.is_set() or self._authority_epoch != attempt_epoch:
@@ -353,7 +370,12 @@ class FlowSessionAuthority:
                 grant=grant,
             )
 
-    def validate_action(self, lease: FlowActionLease) -> bool:
+    def validate_action(
+        self,
+        lease: FlowActionLease,
+        *,
+        task_context: str | None = None,
+    ) -> bool:
         with self._lock:
             self._expire_if_needed()
             self._revoke_if_runtime_changed()
@@ -362,6 +384,11 @@ class FlowSessionAuthority:
             if not hmac.compare_digest(lease.session_id, self._session_id or ""):
                 return False
             if not hmac.compare_digest(lease.task_context_digest, self._task_context_digest or ""):
+                return False
+            if task_context is not None and not hmac.compare_digest(
+                lease.task_context_digest,
+                _digest_text(task_context),
+            ):
                 return False
             record = self._action_grants.get(_digest_text(lease.grant))
             return record == (lease.task_context_digest, lease.authority_epoch)
@@ -381,7 +408,12 @@ class FlowSessionAuthority:
 
     def revoke(self, reason: str = "owner_revoked") -> FlowStatus:
         with self._lock:
-            self._clear_flow(reason or "owner_revoked", destroy_bridge=True)
+            effective_reason = (
+                "global_stop"
+                if self._global_stop.is_set()
+                else reason or "owner_revoked"
+            )
+            self._clear_flow(effective_reason, destroy_bridge=True)
             return self.status()
 
     def lock(self, reason: str = "user_locked") -> FlowStatus:
@@ -398,9 +430,13 @@ class FlowSessionAuthority:
         *,
         cwd: Path,
         action_lease: FlowActionLease | None = None,
+        task_context: str | None = None,
     ) -> FlowTurnPolicy:
         del cwd
-        if action_lease is not None and self.validate_action(action_lease):
+        if action_lease is not None and self.validate_action(
+            action_lease,
+            task_context=task_context,
+        ):
             return FlowTurnPolicy(
                 sandbox=SandboxMode.FULL_ACCESS,
                 approval_mode=ApprovalMode.DENY_ALL,
@@ -462,6 +498,8 @@ class FlowSessionAuthority:
         challenge = self._pending_challenge
         if challenge is None or assertion.challenge != challenge:
             raise FlowAuthenticationError("native assertion challenge is invalid")
+        if assertion.owner_verification != "verified":
+            raise FlowAuthenticationError("native owner verification is invalid")
         now = self._clock()
         if now >= challenge.expires_at:
             self._invalidate_pending_activation()
@@ -482,7 +520,11 @@ class FlowSessionAuthority:
             raise FlowAuthenticationError("native assertion runtime binding is invalid")
         expected = hmac.new(
             bytes(self._bridge_secret or b""),
-            challenge.assertion_message(nonce=assertion.nonce, authenticated_at=assertion.authenticated_at),
+            challenge.assertion_message(
+                nonce=assertion.nonce,
+                authenticated_at=assertion.authenticated_at,
+                owner_verification=assertion.owner_verification,
+            ),
             hashlib.sha256,
         ).hexdigest()
         if not hmac.compare_digest(expected, assertion.signature):

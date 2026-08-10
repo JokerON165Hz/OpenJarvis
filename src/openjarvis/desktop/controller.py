@@ -19,10 +19,16 @@ import uuid
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from openjarvis.desktop.models import DesktopArtifact, DesktopRect, DesktopWindow
+from openjarvis.desktop.safety import (
+    DesktopActionGuard,
+    WindowBounds,
+    WindowIdentity,
+    WindowSnapshot,
+)
 from openjarvis.desktop.win32 import Win32SemanticBackend, WindowsDesktopError
 from openjarvis.tasks.policy import RiskLevel
 from openjarvis.tasks.types import ExecutionLane
@@ -205,6 +211,106 @@ class DesktopAccessStore:
             temporary.unlink(missing_ok=True)
 
 
+class OwnedBrowserService(Protocol):
+    """Public operations provided by the owned CDP session service."""
+
+    def create(self): ...
+
+    def open_tab(self, session_id: str, url: str, *, timeout: float = 15.0): ...
+
+    def navigate(
+        self,
+        session_id: str,
+        url: str,
+        *,
+        target_id: str | None = None,
+        timeout: float = 15.0,
+    ): ...
+
+    def close_tab(
+        self,
+        session_id: str,
+        target_id: str,
+        *,
+        timeout: float = 2.0,
+    ): ...
+
+    def global_stop(self): ...
+
+
+class _ControllerSafetyBackend:
+    """Adapt productive semantic backends to the complete guard snapshot contract."""
+
+    def __init__(self, controller: ProductiveDesktopController) -> None:
+        self.controller = controller
+        self._fallback_started: dict[tuple[int, str], int] = {}
+
+    def now(self) -> float:
+        callback = getattr(self.controller.backend, "now", None)
+        return float(callback()) if callable(callback) else time.monotonic()
+
+    def snapshot(self, hwnd: int) -> WindowSnapshot:
+        direct = getattr(self.controller.backend, "snapshot", None)
+        if callable(direct):
+            return direct(hwnd)
+        window = next(
+            (item for item in self.controller._windows.values() if item.handle == hwnd),
+            None,
+        )
+        if window is None:
+            raise WindowsDesktopError("desktop target is no longer connected")
+        window = self.controller.backend.refresh_window(window)
+        executable = self.controller.backend.process_executable(window.process_id)
+        started_callback = getattr(
+            self.controller.backend, "process_started_at", None
+        )
+        if callable(started_callback):
+            started_at = int(started_callback(window.process_id))
+        else:
+            key = (window.process_id, executable.casefold())
+            started_at = self._fallback_started.setdefault(key, time.time_ns())
+        session_callback = getattr(
+            self.controller.backend, "process_session_id", None
+        )
+        session_id = (
+            int(session_callback(window.process_id))
+            if callable(session_callback)
+            else 0
+        )
+        monitor_callback = getattr(self.controller.backend, "monitor_id", None)
+        monitor_id = (
+            str(monitor_callback(window))
+            if callable(monitor_callback)
+            else "monitor:unreported"
+        )
+        modal_callback = getattr(self.controller.backend, "is_modal_blocked", None)
+        modal = bool(modal_callback(window)) if callable(modal_callback) else False
+        desktop_name = self.controller.backend.input_desktop_name()
+        bounds = window.bounds
+        return WindowSnapshot(
+            identity=WindowIdentity(
+                hwnd=window.handle,
+                pid=window.process_id,
+                process_started_at=started_at,
+                executable=executable,
+                title=window.title,
+                session_id=session_id,
+            ),
+            bounds=WindowBounds(
+                bounds.left,
+                bounds.top,
+                bounds.right,
+                bounds.bottom,
+            ),
+            dpi=window.dpi,
+            monitor_id=monitor_id,
+            focused=bool(self.controller.backend.is_focused(window)),
+            modal=modal,
+            secure_desktop=desktop_name not in {"", "Default"},
+            locked_session=desktop_name == "",
+        )
+
+
 class ProductiveDesktopController:
     """Attach to explicitly granted existing windows with verification and audit."""
 
@@ -216,6 +322,9 @@ class ProductiveDesktopController:
         artifact_root: str | Path,
         event_sink=None,
         flow_authority=None,
+        browser_service: OwnedBrowserService | None = None,
+        allow_browser_input_fallback: bool = False,
+        action_guard: DesktopActionGuard | None = None,
     ) -> None:
         self.backend = backend
         self.access_store = access_store
@@ -223,12 +332,18 @@ class ProductiveDesktopController:
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         self.event_sink = event_sink or (lambda _name, _payload: None)
         self.flow_authority = flow_authority
+        self.browser_service = browser_service
+        self.allow_browser_input_fallback = allow_browser_input_fallback
         self._windows: dict[str, DesktopWindow] = {}
         self._lock = threading.RLock()
         self._interrupted = threading.Event()
         self._interrupt_epoch = 0
         self._last_action: dict[str, Any] | None = None
         self._audit: list[dict[str, Any]] = []
+        self._browser_targets: dict[str, str] = {}
+        self.action_guard = action_guard or DesktopActionGuard(
+            _ControllerSafetyBackend(self)
+        )
 
     def status(self) -> dict[str, Any]:
         grants = self.access_store.list()
@@ -319,7 +434,6 @@ class ProductiveDesktopController:
                 f"desktop target requires exactly one matching window; found {len(matches)}"
             )
         self._windows[target_id] = matches[0]
-        self._interrupted.clear()
         self._emit(
             "desktop.connected", target_id, {"process_id": matches[0].process_id}
         )
@@ -385,55 +499,158 @@ class ProductiveDesktopController:
         *,
         new_tab: bool = False,
     ) -> dict[str, Any]:
-        """Navigate an existing browser window while preserving its signed-in profile."""
+        """Navigate an owned CDP target, or an explicitly enabled input fallback."""
 
         parsed = urlsplit(url.strip())
         if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
             raise ValueError("browser URL must be an absolute HTTP(S) URL")
         if len(url) > 8192:
             raise ValueError("browser URL exceeds 8192 characters")
+        if self.browser_service is not None:
+            if new_tab:
+                return self.browser_open_tab(target_id, url)
+            result = dict(
+                self.browser_service.navigate(
+                    target_id,
+                    url,
+                    target_id=self._browser_targets.get(target_id),
+                )
+            )
+            self._browser_targets[target_id] = str(result["target_id"])
+            self._record("browser_navigate", target_id, bool(result.get("verified")), result)
+            return result
+        if not self.allow_browser_input_fallback:
+            raise WindowsDesktopError(
+                "owned CDP browser service is required; input fallback is disabled"
+            )
+        return self._browser_input_fallback(target_id, url, new_tab=new_tab)
+
+    def browser_create_session(self) -> dict[str, Any]:
+        """Create one isolated browser session owned by this runtime."""
+
+        if self.browser_service is None:
+            raise WindowsDesktopError("owned CDP browser service is unavailable")
+        self._check_interrupt()
+        session = self.browser_service.create()
+        self._check_interrupt()
+        status = getattr(session.status, "value", str(session.status))
+        if status != "ready":
+            raise WindowsDesktopError("owned browser session did not become ready")
+        result = {
+            "session_id": str(session.session_id),
+            "status": status,
+            "verified": True,
+        }
+        self._record("browser_create_session", str(session.session_id), True, result)
+        return result
+
+    def browser_open_tab(self, session_id: str, url: str) -> dict[str, Any]:
+        """Open exactly one verified target through an owned CDP session."""
+
+        parsed = urlsplit(url.strip())
+        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("browser URL must be an absolute HTTP(S) URL")
+        if len(url) > 8192:
+            raise ValueError("browser URL exceeds 8192 characters")
+        if self.browser_service is None:
+            if not self.allow_browser_input_fallback:
+                raise WindowsDesktopError(
+                    "owned CDP browser service is required; input fallback is disabled"
+                )
+            return self._browser_input_fallback(session_id, url, new_tab=True)
+        self._check_interrupt()
+        result = dict(self.browser_service.open_tab(session_id, url))
+        self._check_interrupt()
+        if not (
+            result.get("verified") is True
+            and result.get("navigation_verified") is True
+            and result.get("target_id")
+            and result.get("final_url")
+            and result.get("ready_state") in {"interactive", "complete"}
+        ):
+            raise WindowsDesktopError("owned browser tab verification failed")
+        target_id = str(result["target_id"])
+        self._browser_targets[session_id] = target_id
+        self._record("browser_open_tab", session_id, True, result)
+        return result
+
+    def _browser_input_fallback(
+        self,
+        target_id: str,
+        url: str,
+        *,
+        new_tab: bool,
+    ) -> dict[str, Any]:
+        """Bounded legacy fallback; it cannot claim verified navigation success."""
+
         window = self._window(target_id)
         self._focus(window)
+        planned = self.action_guard.capture_target(window.handle)
+        planned = self.action_guard.validate_before_mutation(planned)
         before = self.screenshot(target_id)
-        previous_clipboard: str | None
-        try:
-            previous_clipboard = self.backend.clipboard_read()
-        except WindowsDesktopError:
-            previous_clipboard = None
-        try:
-            if new_tab:
-                self.backend.send_hotkey(window, "ctrl+t")
-            self.backend.send_hotkey(window, "ctrl+l")
-            self.backend.clipboard_write(url)
-            self.backend.send_hotkey(window, "ctrl+v")
-        finally:
-            if previous_clipboard is not None:
-                self.backend.clipboard_write(previous_clipboard)
-        self.backend.send_hotkey(window, "enter")
-        time.sleep(0.35)
-        after_window = self.backend.refresh_window(window)
-        after = self.screenshot(target_id)
-        verified = (
-            after_window.process_id == window.process_id
-            and self.backend.is_focused(after_window)
-            and before.sha256 != after.sha256
+
+        def mutate(_snapshot):
+            previous_clipboard: str | None
+            try:
+                previous_clipboard = self.backend.clipboard_read()
+            except WindowsDesktopError:
+                previous_clipboard = None
+            try:
+                if new_tab:
+                    self.backend.send_hotkey(window, "ctrl+t")
+                self.backend.send_hotkey(window, "ctrl+l")
+                self.backend.clipboard_write(url)
+                self.backend.send_hotkey(window, "ctrl+v")
+            finally:
+                if previous_clipboard is not None:
+                    self.backend.clipboard_write(previous_clipboard)
+            self.backend.send_hotkey(window, "enter")
+            time.sleep(0.35)
+            return self.screenshot(target_id)
+
+        after = self.action_guard.run_verified(
+            planned,
+            mutate,
+            lambda snapshot, artifact: (
+                snapshot.focused
+                and snapshot.dpi == planned.dpi
+                and snapshot.monitor_id == planned.monitor_id
+                and snapshot.bounds == planned.bounds
+                and artifact.sha256 != before.sha256
+            ),
         )
         self._record(
-            "browser_navigate",
+            "browser_input_fallback",
             target_id,
-            verified,
-            {"artifact_id": after.artifact_id, "new_tab": new_tab},
+            False,
+            {
+                "artifact_id": after.artifact_id,
+                "new_tab": new_tab,
+                "reason": "final URL and load state are not observable through input fallback",
+            },
         )
         return {
             "target_id": target_id,
             "artifact_id": after.artifact_id,
             "new_tab": new_tab,
-            "verified": verified,
+            "verified": False,
+            "navigation_verified": False,
+            "fallback": "focus_clipboard_hotkey",
+            "reason": "final URL and load state are not observable through input fallback",
         }
 
     def browser_close_tab(self, target_id: str) -> dict[str, Any]:
         """Close the active tab in an existing browser window."""
 
+        if self.browser_service is not None:
+            browser_target = self._browser_targets.get(target_id)
+            if not browser_target:
+                raise WindowsDesktopError("owned browser session has no active target")
+            result = dict(self.browser_service.close_tab(target_id, browser_target))
+            if result.get("verified") is not True:
+                raise WindowsDesktopError("owned browser target close was not verified")
+            self._browser_targets.pop(target_id, None)
+            return result
         return self.hotkey(target_id, "ctrl+w")
 
     def active_window(self) -> dict[str, Any]:
@@ -521,15 +738,33 @@ class ProductiveDesktopController:
     def focus(self, target_id: str) -> dict[str, Any]:
         self._grant(target_id, "focus", require_interact=True)
         window = self._window(target_id)
-        self._focus(window)
-        verified = self.backend.is_focused(window)
+        planned = self.action_guard.capture_target(window.handle)
+        verified = self.action_guard.run_verified(
+            planned,
+            lambda _snapshot: bool(self.backend.focus(window)),
+            lambda snapshot, result: (
+                result
+                and snapshot.focused
+                and self._guard_context_unchanged(planned, snapshot)
+            ),
+            require_focus=False,
+        )
         self._record("focus", target_id, verified)
         return {"target_id": target_id, "verified": verified}
 
     def set_window_state(self, target_id: str, state: str) -> dict[str, Any]:
         self._grant(target_id, "window", require_interact=True)
         window = self._window(target_id)
-        observed = self.backend.set_window_state(window, state)
+        planned = self.action_guard.capture_target(window.handle)
+        observed = self.action_guard.run_verified(
+            planned,
+            lambda _snapshot: self.backend.set_window_state(window, state),
+            lambda snapshot, result: (
+                result == state
+                and not snapshot.modal
+            ),
+            require_focus=False,
+        )
         verified = observed == state
         self._record("window_state", target_id, verified, {"state": observed})
         return {"target_id": target_id, "state": observed, "verified": verified}
@@ -539,6 +774,7 @@ class ProductiveDesktopController:
     ) -> dict[str, Any]:
         self._grant(target_id, "window", require_interact=True)
         window = self._window(target_id)
+        planned = self.action_guard.capture_target(window.handle)
         display = self.backend.display_context(window)
         requested = DesktopRect(left, top, left + width, top + height)
         if (
@@ -548,7 +784,24 @@ class ProductiveDesktopController:
             or requested.bottom > display.virtual_top + display.virtual_height
         ):
             raise WindowsDesktopError("window move escaped the virtual desktop")
-        observed = self.backend.move_window(window, requested)
+        observed = self.action_guard.run_verified(
+            planned,
+            lambda _snapshot: self.backend.move_window(window, requested),
+            lambda snapshot, result: (
+                result.bounds == requested
+                and snapshot.bounds
+                == WindowBounds(
+                    requested.left,
+                    requested.top,
+                    requested.right,
+                    requested.bottom,
+                )
+                and snapshot.dpi == planned.dpi
+                and snapshot.monitor_id == planned.monitor_id
+                and not snapshot.modal
+            ),
+            require_focus=False,
+        )
         self._windows[target_id] = observed
         verified = observed.bounds == requested
         self._record(
@@ -564,6 +817,7 @@ class ProductiveDesktopController:
     def launch(self, target_id: str) -> dict[str, Any]:
         grant = self._grant(target_id, "launch", require_interact=True)
         self._require_default_desktop()
+        self.action_guard.ensure_active()
         executable = Path(grant.executable).resolve(strict=True)
         try:
             existing = self.connect(target_id)
@@ -592,26 +846,40 @@ class ProductiveDesktopController:
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
+        self._register_launched_process(process)
         deadline = time.monotonic() + 12.0
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             self._check_interrupt()
+            self.action_guard.ensure_active()
             try:
                 window = self.connect(target_id)
-                verified = (
-                    window.process_id == process.pid
-                    or self.backend.process_executable(window.process_id).casefold()
-                    == str(executable).casefold()
+                captured = self.action_guard.capture_target(window.handle)
+                verified = self._is_launched_process(
+                    window.process_id, process.pid
+                ) and captured.identity.pid == window.process_id
+                if verified:
+                    if captured.identity.pid != process.pid:
+                        self.action_guard.register_owned_process(
+                            captured.identity.pid,
+                            captured.identity.process_started_at,
+                        )
+                    self._record(
+                        "launch", target_id, True, {"process_id": window.process_id}
+                    )
+                    return {
+                        "target_id": target_id,
+                        "process_id": window.process_id,
+                        "window_title": window.title[:256],
+                        "verified": True,
+                    }
+                # A same-executable window is not proof that it belongs to the
+                # process just launched. Never adopt it as owned.
+                self._windows.pop(target_id, None)
+                last_error = WindowsDesktopError(
+                    "granted window is not owned by the launched process"
                 )
-                self._record(
-                    "launch", target_id, verified, {"process_id": window.process_id}
-                )
-                return {
-                    "target_id": target_id,
-                    "process_id": window.process_id,
-                    "window_title": window.title[:256],
-                    "verified": verified,
-                }
+                time.sleep(0.15)
             except WindowsDesktopError as exc:
                 last_error = exc
                 time.sleep(0.15)
@@ -625,6 +893,7 @@ class ProductiveDesktopController:
         if not (self.flow_authority and self.flow_authority.is_flow()):
             raise WindowsDesktopError("application launch requires Flow mode")
         self._require_default_desktop()
+        self.action_guard.ensure_active()
         path = _resolve_launch_executable(executable)
         process = subprocess.Popen(
             [str(path), *(arguments or [])],
@@ -634,31 +903,42 @@ class ProductiveDesktopController:
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
+        self._register_launched_process(process)
         deadline = time.monotonic() + 15.0
         while time.monotonic() < deadline:
             self._check_interrupt()
+            self.action_guard.ensure_active()
             for window in self.backend.visible_windows():
-                if window.process_id == process.pid:
+                if self._is_launched_process(window.process_id, process.pid):
                     target_id = f"window:{window.handle}"
                     self._windows[target_id] = window
+                    captured = self.action_guard.capture_target(window.handle)
+                    if captured.identity.pid != process.pid:
+                        self.action_guard.register_owned_process(
+                            captured.identity.pid,
+                            captured.identity.process_started_at,
+                        )
                     return {
                         "target_id": target_id,
-                        "process_id": process.pid,
+                        "process_id": window.process_id,
                         "window_title": window.title[:256],
                         "verified": True,
                     }
             time.sleep(0.15)
-        return {
-            "target_id": None,
-            "process_id": process.pid,
-            "window_title": "",
-            "verified": process.poll() is None,
-        }
+        raise WindowsDesktopError(
+            "launched application did not expose an owned verified window"
+        )
 
     def close_window(self, target_id: str) -> dict[str, Any]:
         self._grant(target_id, "window", require_interact=True)
         window = self._window(target_id)
+        planned = self.action_guard.capture_target(window.handle)
+        self.action_guard.validate_before_mutation(planned, require_focus=False)
         self.backend.close(window)
+        self.action_guard.ensure_active()
+        exists = getattr(self.backend, "window_exists", None)
+        if callable(exists) and exists(window):
+            raise WindowsDesktopError("desktop window remained open after close")
         self._windows.pop(target_id, None)
         return {"target_id": target_id, "verified": True}
 
@@ -671,12 +951,20 @@ class ProductiveDesktopController:
         with self._lock:
             window = self._window(target_id)
             self._focus(window)
+            planned = self.action_guard.capture_target(window.handle)
             element = self.backend.find_element(
                 window, automation_id=automation_id, role=role
             )
             if self.backend.is_password_element(window, element):
                 raise WindowsDesktopError("protected password fields are not permitted")
-            observed = self.backend.set_text(window, element, value)
+            observed = self.action_guard.run_verified(
+                planned,
+                lambda _snapshot: self.backend.set_text(window, element, value),
+                lambda snapshot, result: (
+                    result == value
+                    and self._guard_context_unchanged(planned, snapshot)
+                ),
+            )
             verified = observed == value
             self._emit(
                 "desktop.action_verified",
@@ -713,6 +1001,7 @@ class ProductiveDesktopController:
         with self._lock:
             window = self._window(target_id)
             self._focus(window)
+            planned = self.action_guard.capture_target(window.handle)
             before = self.screenshot(target_id)
             element = self.backend.find_element(
                 window, automation_id=automation_id, role=role
@@ -741,8 +1030,18 @@ class ProductiveDesktopController:
                 raise WindowsDesktopError(
                     "sensitive control requires the approval-scoped desktop tool"
                 )
-            self.backend.click(window, element)
-            after = self.screenshot(target_id)
+            def mutate(_snapshot):
+                self.backend.click(window, element)
+                return self.screenshot(target_id)
+
+            after = self.action_guard.run_verified(
+                planned,
+                mutate,
+                lambda snapshot, artifact: (
+                    artifact.sha256 != before.sha256
+                    and self._guard_context_unchanged(planned, snapshot)
+                ),
+            )
             verified = before.sha256 != after.sha256
             self._emit(
                 "desktop.action_verified",
@@ -779,10 +1078,21 @@ class ProductiveDesktopController:
 
     def clipboard_write(self, target_id: str, value: str) -> dict[str, Any]:
         self._grant(target_id, "clipboard", require_interact=True)
-        self._window(target_id)
+        window = self._window(target_id)
         if len(value) > 16_384:
             raise ValueError("clipboard text exceeds 16384 characters")
-        observed = self.backend.clipboard_write(value)
+        planned = self.action_guard.capture_target(window.handle)
+        observed = self.action_guard.run_verified(
+            planned,
+            lambda _snapshot: self.backend.clipboard_write(value),
+            lambda snapshot, result: (
+                result == value
+                and self._guard_context_unchanged(
+                    planned, snapshot, require_focus=False
+                )
+            ),
+            require_focus=False,
+        )
         verified = observed == value
         self._record("clipboard_write", target_id, verified, {"length": len(value)})
         return {"target_id": target_id, "length": len(observed), "verified": verified}
@@ -822,12 +1132,15 @@ class ProductiveDesktopController:
             raise WindowsDesktopError("hotkey syntax is invalid")
         window = self._window(target_id)
         self._focus(window)
-        before = self.backend.refresh_window(window)
-        self.backend.send_hotkey(window, chord)
-        after = self.backend.refresh_window(window)
-        verified = before.process_id == after.process_id and self.backend.is_focused(
-            after
+        planned = self.action_guard.capture_target(window.handle)
+        self.action_guard.run_verified(
+            planned,
+            lambda _snapshot: self.backend.send_hotkey(window, chord),
+            lambda snapshot, _result: self._guard_context_unchanged(
+                planned, snapshot
+            ),
         )
+        verified = True
         self._record("hotkey", target_id, verified, {"chord": chord.casefold()})
         return {"target_id": target_id, "chord": chord.casefold(), "verified": verified}
 
@@ -837,10 +1150,21 @@ class ProductiveDesktopController:
             raise ValueError("scroll delta must be between -1200 and 1200")
         window = self._window(target_id)
         self._focus(window)
+        planned = self.action_guard.capture_target(window.handle)
         before = self.screenshot(target_id)
-        self.backend.scroll(window, delta)
-        time.sleep(0.08)
-        after = self.screenshot(target_id)
+        def mutate(_snapshot):
+            self.backend.scroll(window, delta)
+            time.sleep(0.08)
+            return self.screenshot(target_id)
+
+        after = self.action_guard.run_verified(
+            planned,
+            mutate,
+            lambda snapshot, artifact: (
+                artifact.sha256 != before.sha256
+                and self._guard_context_unchanged(planned, snapshot)
+            ),
+        )
         verified = before.sha256 != after.sha256
         self._record("scroll", target_id, verified, {"artifact_id": after.artifact_id})
         return {
@@ -854,6 +1178,7 @@ class ProductiveDesktopController:
         window = self.backend.refresh_window(self._window(target_id))
         self._windows[target_id] = window
         self._focus(window)
+        planned = self.action_guard.capture_target(window.handle)
         display = self.backend.display_context(window)
         before = self.screenshot(target_id)
         if (
@@ -861,11 +1186,23 @@ class ProductiveDesktopController:
             or not window.bounds.top <= y < window.bounds.bottom
         ):
             raise WindowsDesktopError("visual click escaped the current window bounds")
-        self._check_interrupt()
-        self.backend.coordinate_click(window, x, y)
-        time.sleep(0.08)
+        evidence = self.action_guard.visual_evidence(before.sha256, planned)
+        self.action_guard.validate_visual_action(planned, evidence, x=x, y=y)
+
+        def mutate(_snapshot):
+            self.backend.coordinate_click(window, x, y)
+            time.sleep(0.08)
+            return self.screenshot(target_id)
+
+        after = self.action_guard.run_verified(
+            planned,
+            mutate,
+            lambda snapshot, artifact: (
+                artifact.sha256 != before.sha256
+                and self._guard_context_unchanged(planned, snapshot)
+            ),
+        )
         after_window = self.backend.refresh_window(window)
-        after = self.screenshot(target_id)
         verified = (
             before.sha256 != after.sha256
             and after_window.process_id == window.process_id
@@ -886,13 +1223,27 @@ class ProductiveDesktopController:
     def interrupt(self) -> None:
         self._interrupted.set()
         self._interrupt_epoch += 1
-        epoch = self._interrupt_epoch
+        self.action_guard.request_stop()
         self.backend.interrupt_semantic()
+        if self.browser_service is not None:
+            self.browser_service.global_stop()
+        terminate = getattr(self.backend, "terminate_owned_process", None)
+        if callable(terminate):
+            self.action_guard.cleanup_owned_processes(terminate)
         self._record("interrupt", "global", True)
         self.event_sink("desktop.interrupted", {})
-        reset = threading.Timer(1.0, self._clear_completed_interrupt, args=(epoch,))
-        reset.daemon = True
-        reset.start()
+
+    def global_stop(self) -> None:
+        self.interrupt()
+
+    def resume_after_stop(self) -> None:
+        """Explicit trusted task startup hook; stop never clears on a timer."""
+
+        self._interrupted.clear()
+        self.action_guard.clear_stop()
+        resume = getattr(self.browser_service, "resume_after_stop", None)
+        if callable(resume):
+            resume()
 
     def close(self) -> None:
         self.interrupt()
@@ -1007,16 +1358,61 @@ class ProductiveDesktopController:
         if self._interrupted.is_set():
             raise WindowsDesktopError("desktop controller interrupted")
 
-    def _clear_completed_interrupt(self, epoch: int) -> None:
-        if self._interrupt_epoch == epoch:
-            self._interrupted.clear()
-
     def _require_default_desktop(self) -> None:
         name = self.backend.input_desktop_name()
         if name != "Default":
             raise WindowsDesktopError(
                 "Secure Desktop/UAC/lock-screen interaction is not permitted"
             )
+
+    def _register_launched_process(self, process: subprocess.Popen) -> None:
+        """Track the exact spawned PID before observing any child window."""
+
+        started_at = getattr(self.backend, "process_started_at", None)
+        if not callable(started_at):
+            self._terminate_untracked_process(process)
+            raise WindowsDesktopError(
+                "launched process start identity cannot be verified"
+            )
+        try:
+            process_started_at = int(started_at(process.pid))
+        except Exception as exc:
+            self._terminate_untracked_process(process)
+            raise WindowsDesktopError(
+                "launched process start identity cannot be verified"
+            ) from exc
+        self.action_guard.register_owned_process(process.pid, process_started_at)
+
+    def _is_launched_process(self, process_id: int, root_process_id: int) -> bool:
+        if process_id == root_process_id:
+            return True
+        verify_child = getattr(self.backend, "is_owned_process", None)
+        return bool(
+            callable(verify_child) and verify_child(process_id, root_process_id)
+        )
+
+    @staticmethod
+    def _terminate_untracked_process(process: subprocess.Popen) -> None:
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _guard_context_unchanged(
+        planned: WindowSnapshot,
+        observed: WindowSnapshot,
+        *,
+        require_focus: bool = True,
+    ) -> bool:
+        return bool(
+            (not require_focus or observed.focused)
+            and not observed.modal
+            and observed.bounds == planned.bounds
+            and observed.dpi == planned.dpi
+            and observed.monitor_id == planned.monitor_id
+        )
 
     def _emit(self, event: str, target_id: str, payload: dict[str, Any]) -> None:
         self.event_sink(event, {"target_id": target_id, **payload})
@@ -1554,14 +1950,33 @@ def desktop_tool_runtimes(
             ),
         ]
     )
-    browser_target_schema = {
+    browser_session_target_schema = {
         "type": "object",
         "properties": {
+            "session_id": {"type": "string", "minLength": 1, "maxLength": 80},
+            # Backward-compatible alias retained for existing callers. New
+            # clients use session_id so a desktop grant cannot be confused
+            # with an owned browser session.
             "target_id": {"type": "string", "minLength": 1, "maxLength": 80},
             "url": {"type": "string", "minLength": 1, "maxLength": 8192},
         },
-        "required": ["target_id", "url"],
+        "required": ["url"],
     }
+    browser_session_schema = {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "minLength": 1, "maxLength": 80},
+            "target_id": {"type": "string", "minLength": 1, "maxLength": 80},
+        },
+        "required": [],
+    }
+
+    def browser_session_id(args: dict[str, Any]) -> str:
+        value = args.get("session_id") or args.get("target_id")
+        if not value:
+            raise ValueError("owned browser session_id is required")
+        return str(value)
+
     extra.extend(
         [
             (
@@ -1581,16 +1996,31 @@ def desktop_tool_runtimes(
             ),
             (
                 make_manifest(
+                    "browser.create_session",
+                    "Create and verify an isolated browser session owned by this runtime.",
+                    empty_schema,
+                    capability="browser:full",
+                    risk=RiskLevel.EXTERNAL_PREPARATION,
+                    side_effect=SideEffectClass.VISIBLE_PREPARATION,
+                ),
+                RegisteredToolRuntime(
+                    handler=lambda _args: controller.browser_create_session(),
+                    verifier=verify,
+                    interrupt=controller.interrupt,
+                ),
+            ),
+            (
+                make_manifest(
                     "browser.navigate",
-                    "Navigate the active tab of an existing signed-in browser window.",
-                    browser_target_schema,
+                    "Navigate the active target of an owned isolated browser session.",
+                    browser_session_target_schema,
                     capability="browser:full",
                     risk=RiskLevel.EXTERNAL_PREPARATION,
                     side_effect=SideEffectClass.VISIBLE_PREPARATION,
                 ),
                 RegisteredToolRuntime(
                     handler=lambda args: controller.browser_navigate(
-                        str(args["target_id"]), str(args["url"])
+                        browser_session_id(args), str(args["url"])
                     ),
                     verifier=verify,
                     interrupt=controller.interrupt,
@@ -1599,15 +2029,15 @@ def desktop_tool_runtimes(
             (
                 make_manifest(
                     "browser.open_tab",
-                    "Open a URL in a new tab of an existing signed-in browser window.",
-                    browser_target_schema,
+                    "Open and verify a URL target in an owned isolated CDP browser session.",
+                    browser_session_target_schema,
                     capability="browser:full",
                     risk=RiskLevel.EXTERNAL_PREPARATION,
                     side_effect=SideEffectClass.VISIBLE_PREPARATION,
                 ),
                 RegisteredToolRuntime(
-                    handler=lambda args: controller.browser_navigate(
-                        str(args["target_id"]), str(args["url"]), new_tab=True
+                    handler=lambda args: controller.browser_open_tab(
+                        browser_session_id(args), str(args["url"])
                     ),
                     verifier=verify,
                     interrupt=controller.interrupt,
@@ -1616,15 +2046,15 @@ def desktop_tool_runtimes(
             (
                 make_manifest(
                     "browser.close_tab",
-                    "Close the active tab in an existing signed-in browser window.",
-                    target_schema,
+                    "Close the active owned CDP target and verify it is absent.",
+                    browser_session_schema,
                     capability="browser:full",
                     risk=RiskLevel.REVERSIBLE_WORKSPACE,
                     side_effect=SideEffectClass.REVERSIBLE_LOCAL_WRITE,
                 ),
                 RegisteredToolRuntime(
                     handler=lambda args: controller.browser_close_tab(
-                        str(args["target_id"])
+                        browser_session_id(args)
                     ),
                     verifier=verify,
                     interrupt=controller.interrupt,

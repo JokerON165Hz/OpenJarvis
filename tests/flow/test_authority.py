@@ -272,6 +272,10 @@ def test_global_stop_is_deterministic_and_prevents_reactivation(binding: Mutable
     assert not authority.validate_action(lease)
     with pytest.raises(FlowAuthenticationError, match="global stop"):
         authority.rotate_bridge_secret(ROTATED_SECRET)
+    with pytest.raises(FlowAuthenticationError, match="global stop"):
+        authority.activate_assistant()
+
+    assert authority.lock("late_lock").lock_reason == "global_stop"
 
 
 def test_untrusted_context_cannot_elevate_authority(binding: MutableBindingProvider) -> None:

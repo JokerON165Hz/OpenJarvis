@@ -1728,26 +1728,77 @@ async fn native_owner_verification() -> Result<String, String> {
 #[tauri::command]
 async fn activate_flow_mode(
     flow_bridge: tauri::State<'_, FlowBridgeSecret>,
+    task_context: String,
 ) -> Result<serde_json::Value, String> {
-    let owner = native_owner_verification().await?;
+    if task_context.trim().is_empty() || task_context.len() > 1024 {
+        return Err("Flow task context is invalid".into());
+    }
+    let client = reqwest::Client::new();
+    let challenge_response = client
+        .post(format!("{}/v1/flow/challenge", api_base()))
+        .header("X-OpenJarvis-Native-Bridge", "tauri")
+        .json(&serde_json::json!({"task_context": task_context}))
+        .send()
+        .await
+        .map_err(|error| format!("Flow backend is unavailable: {error}"))?;
+    let challenge_status = challenge_response.status();
+    let challenge = challenge_response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("Invalid Flow challenge: {error}"))?;
+    if !challenge_status.is_success() {
+        return Err(challenge
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Flow challenge failed")
+            .to_string());
+    }
+
+    native_owner_verification().await?;
     let nonce = uuid::Uuid::new_v4().to_string();
     let authenticated_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_secs();
-    let message = format!("flow-v1\n{nonce}\n{authenticated_at}\n{owner}");
+    let mut signed = std::collections::BTreeMap::<String, serde_json::Value>::new();
+    for key in [
+        "bridge_generation",
+        "challenge_id",
+        "expires_at",
+        "issued_at",
+        "os_session_id",
+        "owner",
+        "process_id",
+        "process_nonce",
+        "task_context_digest",
+    ] {
+        signed.insert(
+            key.to_string(),
+            challenge
+                .get(key)
+                .cloned()
+                .ok_or_else(|| format!("Flow challenge field is missing: {key}"))?,
+        );
+    }
+    signed.insert("authenticated_at".into(), authenticated_at.into());
+    signed.insert("nonce".into(), nonce.clone().into());
+    signed.insert("owner_verification".into(), "verified".into());
+    signed.insert("version".into(), 2.into());
+    let message = serde_json::to_string(&signed)
+        .map_err(|error| format!("Flow assertion could not be encoded: {error}"))?;
     let mut mac = Hmac::<Sha256>::new_from_slice(flow_bridge.0.as_bytes())
         .map_err(|_| "native Flow bridge secret is invalid".to_string())?;
     mac.update(message.as_bytes());
     let signature = hex::encode(mac.finalize().into_bytes());
-    let response = reqwest::Client::new()
+    let response = client
         .post(format!("{}/v1/flow/activate", api_base()))
         .header("X-OpenJarvis-Native-Bridge", "tauri")
         .json(&serde_json::json!({
+            "challenge": challenge,
             "nonce": nonce,
             "authenticated_at": authenticated_at,
             "signature": signature,
-            "owner": owner,
+            "owner_verification": "verified",
         }))
         .send()
         .await
@@ -1759,6 +1810,29 @@ async fn activate_flow_mode(
         .map_err(|error| format!("Invalid Flow response: {error}"))?;
     if !status.is_success() {
         return Err(payload.get("detail").and_then(|v| v.as_str()).unwrap_or("Flow activation failed").to_string());
+    }
+    Ok(payload)
+}
+
+#[tauri::command]
+async fn global_stop_operator() -> Result<serde_json::Value, String> {
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/flow/global-stop", api_base()))
+        .header("X-OpenJarvis-Native-Bridge", "tauri")
+        .send()
+        .await
+        .map_err(|error| format!("Global Stop backend is unavailable: {error}"))?;
+    let status = response.status();
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("Invalid Global Stop response: {error}"))?;
+    if !status.is_success() {
+        return Err(payload
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Global Stop failed")
+            .to_string());
     }
     Ok(payload)
 }
@@ -3080,6 +3154,7 @@ pub fn run() {
             start_backend,
             stop_backend,
             activate_flow_mode,
+            global_stop_operator,
             check_health,
             fetch_energy,
             fetch_telemetry,

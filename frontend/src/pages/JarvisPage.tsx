@@ -44,6 +44,7 @@ import {
   fetchTaskSummary,
   fetchTaskTimeline,
   fetchToolHealth,
+  globalStopOperator,
   interruptCanonicalTask,
   JarvisApiError,
   pauseCanonicalTask,
@@ -378,7 +379,7 @@ export function JarvisPage() {
     state.setError(null);
     try {
       const status = mode === 'flow'
-        ? await activateFlowMode()
+        ? await activateFlowMode(ensureActiveTaskId())
         : mode === 'assistant'
           ? await activateAssistantMode()
           : await lockFlowMode();
@@ -460,7 +461,7 @@ export function JarvisPage() {
     const failedDraft = submittedDraft;
     try {
       if (flowStatus?.mode === 'flow') {
-        setFlowStatus(await recordFlowActivity(flowStatus.session_id));
+        setFlowStatus(await recordFlowActivity(flowStatus.session_id, taskId));
       }
       const attempt = await attemptCanonicalChat(
         {
@@ -549,6 +550,29 @@ export function JarvisPage() {
     try { await interruptDesktop(); } catch { /* Voice/text stop remains available without desktop access. */ }
     try { await interruptMcp(); } catch { /* MCP may be disabled. */ }
     if (activeTask?.status === 'running') await controlTask('interrupt');
+  };
+
+  const emergencyGlobalStop = async () => {
+    if (flowBusy) return;
+    setFlowBusy(true);
+    state.setError(null);
+    tts.stop();
+    speech.cancelRecording();
+    sendController.current?.abort();
+    try {
+      const result = await globalStopOperator();
+      setFlowStatus(result.flow);
+      await refreshGlobal();
+      if (result.propagation_failures.length > 0) {
+        state.setError(
+          `Global Stop completed with blocked components: ${result.propagation_failures.join(', ')}`,
+        );
+      }
+    } catch (error) {
+      state.setError(error instanceof Error ? error.message : 'Global Stop failed.');
+    } finally {
+      setFlowBusy(false);
+    }
   };
 
   const toggleRecording = async (submitTranscript = false) => {
@@ -916,6 +940,7 @@ export function JarvisPage() {
                 <button type="button" disabled={!activeTask || !['paused', 'recovering'].includes(activeTask.status)} onClick={() => void controlTask('resume')} className="rounded-lg px-3 py-2 text-xs disabled:opacity-40 focus-visible:outline-2" style={{ border: '1px solid var(--color-border)' }}><Play size={13} className="inline mr-1" /> Resume</button>
                 <button type="button" disabled={!activeTask || activeTask.status !== 'running'} onClick={() => void controlTask('interrupt')} className="rounded-lg px-3 py-2 text-xs disabled:opacity-40 focus-visible:outline-2" style={{ border: '1px solid var(--color-border)' }}><CircleStop size={13} className="inline mr-1" /> Interrupt turn</button>
                 <button type="button" disabled={!activeTask || isTerminalTaskStatus(activeTask.status)} onClick={() => void controlTask('cancel')} className="rounded-lg px-3 py-2 text-xs disabled:opacity-40 focus-visible:outline-2" style={{ border: '2px solid var(--color-error)', color: 'var(--color-error)' }}><Ban size={13} className="inline mr-1" /> Cancel task</button>
+                <button type="button" disabled={flowBusy} onClick={() => void emergencyGlobalStop()} className="col-span-2 rounded-lg px-3 py-2 text-xs disabled:opacity-40 focus-visible:outline-2" style={{ border: '2px solid var(--color-error)', color: 'var(--color-error)' }}><AlertTriangle size={13} className="inline mr-1" /> Global Stop</button>
               </div>
             </section>
 

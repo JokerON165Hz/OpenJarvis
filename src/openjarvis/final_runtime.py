@@ -1,7 +1,7 @@
 """Owner-authenticated Flow product runtime and local launcher entry point.
 
-This module deliberately does not construct an Ollama, cloud, browser, or
-channel backend.  Conversational work is owned by the configured Codex task
+This module deliberately does not construct an Ollama, cloud, or channel
+backend. Conversational work is owned by the configured Codex task
 runtime; the ``InferenceEngine`` below exists only so the legacy health surface
 can report a local, offline-ready product process.
 """
@@ -12,6 +12,7 @@ import argparse
 import hmac
 import json
 import os
+import shutil
 import stat
 import sys
 from contextlib import asynccontextmanager
@@ -21,6 +22,13 @@ from typing import Any, Callable, Sequence
 
 from fastapi import HTTPException, Request
 
+from openjarvis.browser import (
+    BrowserProcessManager,
+    BrowserProfilePolicy,
+    BrowserRecoveryController,
+    BrowserSessionService,
+    CdpBrowserAdapter,
+)
 from openjarvis.core.config import JarvisConfig, load_config
 from openjarvis.core.events import EventBus
 from openjarvis.desktop.controller import (
@@ -68,6 +76,36 @@ FINAL_MODEL = "codex-python-sdk"
 FINAL_CODEX_MODEL = "gpt-5.6-terra"
 FINAL_CODEX_EFFORT = "medium"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _find_chromium_executable() -> Path:
+    """Resolve a trusted installed Chromium binary without model input."""
+
+    candidates: list[Path] = []
+    if os.name == "nt":
+        for root_name, suffix in (
+            ("PROGRAMFILES", "Microsoft/Edge/Application/msedge.exe"),
+            ("PROGRAMFILES(X86)", "Microsoft/Edge/Application/msedge.exe"),
+            ("LOCALAPPDATA", "Microsoft/Edge/Application/msedge.exe"),
+            ("PROGRAMFILES", "Google/Chrome/Application/chrome.exe"),
+            ("PROGRAMFILES(X86)", "Google/Chrome/Application/chrome.exe"),
+            ("LOCALAPPDATA", "Google/Chrome/Application/chrome.exe"),
+        ):
+            root = os.environ.get(root_name)
+            if root:
+                candidates.append(Path(root) / suffix)
+    for name in ("msedge", "msedge.exe", "google-chrome", "chromium", "chrome"):
+        resolved = shutil.which(name)
+        if resolved:
+            candidates.append(Path(resolved))
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.is_file():
+            return resolved
+    raise RuntimeError("an installed Edge/Chrome/Chromium executable is required")
 
 
 class FinalCodexHealthEngine(InferenceEngine):
@@ -399,7 +437,12 @@ def build_final_runtime(
     action_store: ActionStore | None = None
     try:
         trace_store = TraceStore(config.traces.db_path)
-        flow_authority = FlowSessionAuthority.from_environment()
+        # The bundled Tauri launcher performs Windows UserConsentVerifier and
+        # signs that result into its one-time native assertion. Standalone app
+        # construction retains the authority's fail-closed verifier default.
+        flow_authority = FlowSessionAuthority.from_environment(
+            trust_native_owner_verification=True
+        )
         tasks = build_codex_task_runtime(
             config.codex,
             bus=bus,
@@ -531,6 +574,17 @@ def build_final_runtime(
 
         for tool in native_tools:
             action_service.register_runtime(tool.manifest, native_runtime(tool))
+        browser_manager = BrowserProcessManager(
+            executable=_find_chromium_executable(),
+            profile_policy=BrowserProfilePolicy(
+                runtime_home / "state" / "browser-profiles"
+            ),
+            visible=True,
+        )
+        browser_service = BrowserSessionService(
+            browser_manager,
+            BrowserRecoveryController(browser_manager, CdpBrowserAdapter()),
+        )
         desktop_controller = ProductiveDesktopController(
             backend=Win32SemanticBackend(),
             access_store=DesktopAccessStore(
@@ -538,6 +592,7 @@ def build_final_runtime(
             ),
             artifact_root=runtime_home / "tool-artifacts" / "desktop",
             flow_authority=flow_authority,
+            browser_service=browser_service,
         )
         for manifest, runtime in desktop_tool_runtimes(desktop_controller):
             if runtime.interrupt is None:
@@ -580,7 +635,7 @@ def build_final_runtime(
             tool_action_service=action_service,
             desktop_controller=desktop_controller,
             mcp_server_registry=mcp_server_registry,
-            browser_session_service=None,
+            browser_session_service=browser_service,
             phase7_learning_runtime=phase7,
             speech_backend=speech_backend,
             tts_backend=tts_backend,
@@ -616,7 +671,7 @@ def build_final_runtime(
                     "local_speech_input": True,
                     "local_voice": True,
                     "analytics": False,
-                    "browser": False,
+                    "browser": True,
                     "channels": False,
                     "mcp": False,
                 },

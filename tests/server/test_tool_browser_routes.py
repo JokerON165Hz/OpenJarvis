@@ -19,7 +19,13 @@ from openjarvis.browser.models import (  # noqa: E402
     BrowserSession,
     BrowserSessionStatus,
 )
-from openjarvis.flow import FlowSessionAuthority  # noqa: E402
+from openjarvis.flow import (  # noqa: E402
+    FlowSessionAuthority,
+    NativeFlowAssertion,
+    OwnerVerificationResult,
+    OwnerVerificationStatus,
+    RuntimeBinding,
+)
 from openjarvis.server.auth_middleware import AuthMiddleware  # noqa: E402
 from openjarvis.server.tool_browser_routes import router  # noqa: E402
 from openjarvis.tasks import ExecutionLane, TaskService, TaskStore  # noqa: E402
@@ -44,6 +50,17 @@ from openjarvis.tools.manifest import (  # noqa: E402
 )
 
 _AUTH = {"Authorization": "Bearer oj_sk_phase5"}
+
+
+class _VerifiedOwner:
+    def verify(self, *, prompt: str) -> OwnerVerificationResult:
+        assert prompt
+        return OwnerVerificationResult(OwnerVerificationStatus.VERIFIED)
+
+
+class _StableBinding:
+    def current(self) -> RuntimeBinding:
+        return RuntimeBinding("test-owner", "test-session", 4242)
 
 
 def _manifest(tool_id: str, risk: RiskLevel) -> ToolManifest:
@@ -200,14 +217,26 @@ def api(tmp_path: Path):
     secret = "f" * 64
     authenticated_at = int(time.time())
     nonce = "tool-browser-native-proof"
-    owner = "test-owner"
-    message = f"flow-v1\n{nonce}\n{authenticated_at}\n{owner}".encode()
-    authority = FlowSessionAuthority(secret)
+    authority = FlowSessionAuthority(
+        secret,
+        owner_verifier=_VerifiedOwner(),
+        binding_provider=_StableBinding(),
+    )
+    challenge = authority.issue_activation_challenge(task_context="task-api")
     authority.activate_flow(
-        nonce=nonce,
-        authenticated_at=authenticated_at,
-        signature=hmac.new(secret.encode(), message, hashlib.sha256).hexdigest(),
-        owner=owner,
+        NativeFlowAssertion(
+            challenge=challenge,
+            nonce=nonce,
+            authenticated_at=authenticated_at,
+            signature=hmac.new(
+                secret.encode(),
+                challenge.assertion_message(
+                    nonce=nonce,
+                    authenticated_at=authenticated_at,
+                ),
+                hashlib.sha256,
+            ).hexdigest(),
+        )
     )
 
     def context(proposal):

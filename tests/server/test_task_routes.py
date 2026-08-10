@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -29,7 +28,13 @@ from openjarvis.codex.types import (  # noqa: E402
 )
 from openjarvis.core.config import JarvisConfig  # noqa: E402
 from openjarvis.core.events import EventBus  # noqa: E402
-from openjarvis.flow import FlowSessionAuthority  # noqa: E402
+from openjarvis.flow import (  # noqa: E402
+    FlowSessionAuthority,
+    NativeFlowAssertion,
+    OwnerVerificationResult,
+    OwnerVerificationStatus,
+    RuntimeBinding,
+)
 from openjarvis.memory.candidates import MemoryCandidateWorkflow  # noqa: E402
 from openjarvis.memory.safe_write import AtomicMarkdownWriter  # noqa: E402
 from openjarvis.memory.task_bridge import MemoryTaskBridge  # noqa: E402
@@ -69,6 +74,41 @@ _CAPABILITIES = BackendCapabilities(
     read_only=True,
     workspace_write=True,
 )
+
+
+class _VerifiedOwner:
+    def verify(self, *, prompt: str) -> OwnerVerificationResult:
+        assert prompt
+        return OwnerVerificationResult(OwnerVerificationStatus.VERIFIED)
+
+
+class _StableBinding:
+    def current(self) -> RuntimeBinding:
+        return RuntimeBinding("test-user", "test-os-session", 4242)
+
+
+def _activate_flow_for_task(
+    authority: FlowSessionAuthority,
+    task_id: str,
+) -> None:
+    challenge = authority.issue_activation_challenge(task_context=task_id)
+    nonce = "task-routes-native-proof"
+    signature = hmac.new(
+        ("f" * 64).encode(),
+        challenge.assertion_message(
+            nonce=nonce,
+            authenticated_at=challenge.issued_at,
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+    authority.activate_flow(
+        NativeFlowAssertion(
+            challenge=challenge,
+            nonce=nonce,
+            authenticated_at=challenge.issued_at,
+            signature=signature,
+        )
+    )
 
 
 class FakeOrchestrator:
@@ -156,17 +196,12 @@ def api_runtime(tmp_path: Path):
     service = TaskService(store)
     orchestrator = FakeOrchestrator(service)
     secret = "f" * 64
-    authenticated_at = int(time.time())
-    nonce = "task-routes-native-proof"
-    owner = "test-owner"
-    message = f"flow-v1\n{nonce}\n{authenticated_at}\n{owner}".encode()
-    authority = FlowSessionAuthority(secret)
-    authority.activate_flow(
-        nonce=nonce,
-        authenticated_at=authenticated_at,
-        signature=hmac.new(secret.encode(), message, hashlib.sha256).hexdigest(),
-        owner=owner,
+    authority = FlowSessionAuthority(
+        secret,
+        owner_verifier=_VerifiedOwner(),
+        binding_provider=_StableBinding(),
     )
+    authority.activate_assistant()
 
     app = FastAPI()
     app.state.task_store = store
@@ -310,6 +345,10 @@ def test_chat_idempotency_prevents_duplicate_turn(api_runtime) -> None:
 
 def test_explicit_memory_command_writes_immediately_in_flow(api_runtime) -> None:
     client, store, _, memory_service, orchestrator = api_runtime
+    _activate_flow_for_task(
+        client.app.state.flow_authority,
+        "task-flow-memory",
+    )
 
     response = _chat(
         client,
@@ -467,8 +506,13 @@ def test_tool_followup_uses_a_fresh_turn_correlation(api_runtime) -> None:
     action = SimpleNamespace(
         action_id="action-browser-windows",
         tool_id="browser.windows",
+        tool_run_id="run-browser-windows",
+        correlation_id="tool-turn",
+        thread_id="thread-tool-loop",
+        turn_id="turn-1",
         status=ActionStatus.VALIDATED,
         verification_status=VerificationStatus.PENDING,
+        effect_known=True,
         output_summary="",
         error="",
     )
@@ -530,15 +574,58 @@ def test_tool_followup_uses_a_fresh_turn_correlation(api_runtime) -> None:
     orchestrator.execute = execute
     response = _chat(
         client,
-        message="Prüfe meine Browserfenster.",
+        message="Browse browser windows and remember this.",
         task_id="task-tool-loop",
         correlation_id="tool-turn",
         idempotency_key="tool-loop-once",
     )
 
     assert response.status_code == 200
-    assert response.json()["content"] == "Der Browserstatus wurde geprüft."
+    assert response.json()["content"] == (
+        "Der Browserstatus wurde geprüft.\n\n"
+        "Ich habe das verifizierte Ergebnis als prüfbaren "
+        "Erinnerungskandidaten vorgemerkt."
+    )
     assert calls == ["tool-turn", "tool-turn:tool-follow-up:1"]
+    candidate = client.app.state.vault_memory_service.candidate_workflow.list()[0]
+    assert candidate.status.value == "proposed"
+    assert candidate.source == "verified_tool_result"
+    assert candidate.metadata["flow_direct"] is False
+    assert candidate.metadata["evidence"]["actions"][0]["action_id"] == (
+        "action-browser-windows"
+    )
+    assert not (
+        client.app.state.vault_memory_service.index.vault_root
+        / candidate.proposed_path
+    ).exists()
+
+
+def test_unverified_assistant_result_is_not_promoted_to_memory(api_runtime) -> None:
+    client, _, _, memory_service, _ = api_runtime
+
+    response = _chat(
+        client,
+        message="Research this topic and remember the result.",
+        task_id="task-unverified-memory",
+        correlation_id="unverified-memory",
+        idempotency_key="unverified-memory-once",
+    )
+
+    assert response.status_code == 200
+    assert not memory_service.candidate_workflow.list()
+    timeline = client.get(
+        "/v1/tasks/task-unverified-memory/timeline"
+    ).json()["events"]
+    rejected = next(
+        event
+        for event in timeline
+        if event["event_type"] == "memory.verified_result_candidate_rejected"
+    )
+    assert rejected["payload"] == {
+        "reason": "missing_complete_verification_evidence",
+        "action_count": 0,
+        "verified_action_count": 0,
+    }
 
 
 def test_backend_turn_failure_keeps_chat_task_reusable(api_runtime) -> None:
@@ -556,12 +643,11 @@ def test_backend_turn_failure_keeps_chat_task_reusable(api_runtime) -> None:
         )
         service.transition(
             task_id,
-            TaskStatus.FAILED,
+            TaskStatus.RECOVERING,
             component="fake_codex",
-            cause="fake_turn_failed",
-            idempotency_key="recoverable-failed",
-            outcome=TaskOutcome.FAILED,
-            error_category="codex_backend_error",
+            cause="fake_turn_recoverable",
+            idempotency_key="recoverable-recovering",
+            payload={"error_category": "codex_backend_error"},
         )
         raise CodexBackendError("synthetic backend failure")
 
@@ -659,6 +745,7 @@ def test_chat_surfaces_usage_limit_without_raw_backend_message(api_runtime) -> N
 
 def test_flow_followup_continues_same_task_without_risk_gate(api_runtime) -> None:
     client, _, _, _, orchestrator = api_runtime
+    _activate_flow_for_task(client.app.state.flow_authority, "task-chat")
     assert _chat(client).status_code == 200
 
     response = _chat(
@@ -913,6 +1000,38 @@ def test_owned_task_runtime_and_trace_store_close_on_server_shutdown() -> None:
     assert orchestrator.closed is True
     assert store.closed is True
     assert traces.closed is True
+
+
+def test_server_startup_recovers_incomplete_tool_actions_before_serving() -> None:
+    class RecoverableActionService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def recover_incomplete(self) -> tuple:
+            self.calls += 1
+            return ()
+
+    engine = MagicMock()
+    engine.engine_id = "fake"
+    engine.health.return_value = True
+    engine.list_models.return_value = ["fake"]
+    config = JarvisConfig()
+    config.analytics.enabled = False
+    config.traces.enabled = False
+    actions = RecoverableActionService()
+    app = create_app(
+        engine,
+        "fake",
+        bus=EventBus(),
+        config=config,
+        tool_action_service=actions,
+    )
+
+    assert actions.calls == 0
+    with TestClient(app) as client:
+        assert actions.calls == 1
+        assert client.get("/health").status_code == 200
+    assert actions.calls == 1
 
 
 def test_lifespan_shutdown_is_idempotent_after_partial_cleanup_failure() -> None:

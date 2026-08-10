@@ -8,7 +8,7 @@ import json
 import threading
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -200,11 +200,63 @@ class ToolActionService:
             interrupted += 1
         return interrupted
 
+    def recover_incomplete(self) -> tuple[ToolAction, ...]:
+        """Fail closed for effects left in flight by a prior process.
+
+        Startup recovery only changes durable state. It never invokes a tool
+        handler or verifier, because the external effect may already exist.
+        """
+
+        incomplete = self.store.list_actions_by_status(
+            {ActionStatus.RUNNING, ActionStatus.VERIFYING}
+        )
+        return tuple(self.recover(action.action_id) for action in incomplete)
+
+    def global_stop(self) -> tuple[ToolAction, ...]:
+        """Cancel every nonterminal owned action and block late completion."""
+
+        stoppable = self.store.list_actions_by_status(
+            {
+                ActionStatus.PROPOSED,
+                ActionStatus.VALIDATED,
+                ActionStatus.WAITING_APPROVAL,
+                ActionStatus.RUNNING,
+                ActionStatus.VERIFYING,
+                ActionStatus.VERIFIED,
+                ActionStatus.FAILED,
+            }
+        )
+        for task_id in sorted({action.task_id for action in stoppable}):
+            self.interrupt_task(task_id)
+
+        stopped: list[ToolAction] = []
+        for action in stoppable:
+            current = self.store.get_action(action.action_id)
+            if current is None:
+                continue
+            if current.status in {
+                ActionStatus.CANCELED,
+                ActionStatus.COMPLETED,
+                ActionStatus.DENIED,
+                ActionStatus.RECOVERY_REQUIRED,
+            }:
+                stopped.append(current)
+                continue
+            try:
+                stopped.append(self.cancel(current.action_id))
+            except (ActionStoreError, ToolActionError):
+                # A concurrent completion/cancel wins atomically. Read back the
+                # durable terminal state instead of reviving the action.
+                latest = self.store.get_action(current.action_id)
+                if latest is not None:
+                    stopped.append(latest)
+        return tuple(stopped)
+
     def _task_interrupted(self, task_id: str) -> bool:
         with self._interrupt_lock:
             return task_id in self._interrupted_tasks
 
-    def create(self, proposal: ToolProposal) -> ToolAction:
+    def create(self, proposal: ToolProposal, *, action_lease=None) -> ToolAction:
         """Validate and persist a proposal without executing before approval."""
 
         stored = self.store.put_proposal(proposal)
@@ -218,6 +270,11 @@ class ToolActionService:
         except ManifestValidationError as exc:
             raise ToolActionError(str(exc)) from exc
         context = self._context_factory(stored)
+        context = self._bind_action_lease(
+            context,
+            action_lease,
+            task_id=stored.task_id,
+        )
         task_risk = None
         if self._tasks is not None:
             task = self._tasks.get(stored.task_id)
@@ -262,12 +319,22 @@ class ToolActionService:
         self._emit(action, "tool.validated", self._decision_payload(decision))
         return action
 
-    async def execute(self, action_id: str) -> ToolAction:
+    async def execute(self, action_id: str, *, action_lease=None) -> ToolAction:
         """Execute one validated action exactly once."""
 
-        return await self._execute(action_id, allow_failed=False)
+        return await self._execute(
+            action_id,
+            allow_failed=False,
+            action_lease=action_lease,
+        )
 
-    async def _execute(self, action_id: str, *, allow_failed: bool) -> ToolAction:
+    async def _execute(
+        self,
+        action_id: str,
+        *,
+        allow_failed: bool,
+        action_lease=None,
+    ) -> ToolAction:
         lock = self._locks.setdefault(action_id, asyncio.Lock())
         async with lock:
             action = self._require_action(action_id)
@@ -306,6 +373,11 @@ class ToolActionService:
                 raise ToolActionError("registered tool has no runtime")
 
             context = self._context_factory(proposal)
+            context = self._bind_action_lease(
+                context,
+                action_lease,
+                task_id=action.task_id,
+            )
             bounded_context = self._bind_risk_floor(action, context)
             decision = self._flow_authority.authorize_tool(manifest, bounded_context)
             if not decision.allowed:
@@ -374,7 +446,7 @@ class ToolActionService:
         )
         return recovered
 
-    async def retry(self, action_id: str) -> ToolAction:
+    async def retry(self, action_id: str, *, action_lease=None) -> ToolAction:
         action = self._require_action(action_id)
         if action.status is not ActionStatus.FAILED:
             raise ToolActionError("only a failed action can be retried")
@@ -392,7 +464,11 @@ class ToolActionService:
             ActionStatus.FAILED,
             retry_count=action.retry_count + 1,
         )
-        return await self._execute(action.action_id, allow_failed=True)
+        return await self._execute(
+            action.action_id,
+            allow_failed=True,
+            action_lease=action_lease,
+        )
 
     async def _execute_in_lane(
         self,
@@ -648,6 +724,27 @@ class ToolActionService:
             approved_once=context.approved_once,
             untrusted_risk=floor,
             allowed_roots=context.allowed_roots,
+        )
+
+    def _bind_action_lease(
+        self,
+        context: ToolPolicyContext,
+        action_lease,
+        *,
+        task_id: str,
+    ) -> ToolPolicyContext:
+        if action_lease is None:
+            return context
+        if not self._flow_authority.validate_action(
+            action_lease,
+            task_context=task_id,
+        ):
+            raise ToolActionError("Flow action lease is missing, stale, or task-mismatched")
+        return replace(
+            context,
+            granted_capabilities=frozenset(
+                (*context.granted_capabilities, action_lease.grant)
+            ),
         )
 
     def _store_output(

@@ -286,6 +286,14 @@ def create_app(
                 is_flow=authority.is_flow,
             )
             flow_monitor.start()
+            action_service = getattr(
+                runtime_app.state, "tool_action_service", None
+            )
+            recover_incomplete = getattr(
+                action_service, "recover_incomplete", None
+            )
+            if callable(recover_incomplete):
+                recover_incomplete()
             _restore_sendblue_bindings(runtime_app)
             if getattr(runtime_app.state, "mcp_server_registry", None) is not None:
                 from openjarvis.mcp.action_bridge import discover_action_tools

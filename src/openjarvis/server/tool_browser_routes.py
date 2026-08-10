@@ -66,6 +66,19 @@ def _browser(request: Request):
     return service
 
 
+def _begin_action_lease(request: Request, task_id: str):
+    authority = getattr(request.app.state, "flow_authority", None)
+    if authority is None or not authority.is_flow():
+        return authority, None
+    status = authority.status()
+    if not status.session_id:
+        raise HTTPException(status_code=403, detail="Flow session is unavailable")
+    return authority, authority.begin_action(
+        session_id=status.session_id,
+        task_context=task_id,
+    )
+
+
 def _manifest_payload(manifest: ToolManifest, *, runtime: bool) -> dict[str, Any]:
     payload = manifest.model_dump(mode="json")
     # Preserve the existing tool-list UI contract while adding the Phase-5
@@ -197,13 +210,19 @@ async def create_task_action(
     if proposal.idempotency_key != idempotency_key:
         raise HTTPException(status_code=409, detail="Idempotency-Key mismatch")
     service = _actions(request)
+    authority, action_lease = _begin_action_lease(request, task_id)
     try:
         service.begin_task(task_id)
-        action = service.create(proposal)
+        action = service.create(proposal, action_lease=action_lease)
         if body.execute and action.status.value == "validated":
-            action = await service.execute(action.action_id)
+            action = await service.execute(
+                action.action_id, action_lease=action_lease
+            )
     except ToolActionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        if authority is not None and action_lease is not None:
+            authority.end_action(action_lease)
     return _action_payload(action, service)
 
 
@@ -251,7 +270,17 @@ async def retry_action(
 ) -> dict[str, Any]:
     try:
         service = _actions(request)
-        return _action_payload(await service.retry(action_id), service)
+        current = service.store.get_action(action_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Action not found")
+        authority, action_lease = _begin_action_lease(request, current.task_id)
+        try:
+            return _action_payload(
+                await service.retry(action_id, action_lease=action_lease), service
+            )
+        finally:
+            if authority is not None and action_lease is not None:
+                authority.end_action(action_lease)
     except ToolActionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

@@ -12,7 +12,13 @@ from pathlib import Path
 
 import pytest
 
-from openjarvis.flow import FlowSessionAuthority
+from openjarvis.flow import (
+    FlowSessionAuthority,
+    NativeFlowAssertion,
+    OwnerVerificationResult,
+    OwnerVerificationStatus,
+    RuntimeBinding,
+)
 from openjarvis.tasks import ExecutionLane, TaskService, TaskStore
 from openjarvis.tasks.policy import RiskLevel, ToolPolicyContext
 from openjarvis.tools.action_service import (
@@ -35,6 +41,17 @@ from openjarvis.tools.manifest import (
     ToolManifest,
     ToolManifestCatalog,
 )
+
+
+class _VerifiedOwner:
+    def verify(self, *, prompt: str) -> OwnerVerificationResult:
+        assert prompt
+        return OwnerVerificationResult(OwnerVerificationStatus.VERIFIED)
+
+
+class _StableBinding:
+    def current(self) -> RuntimeBinding:
+        return RuntimeBinding("action-test-user", "action-test-session", 4242)
 
 
 def _manifest(
@@ -139,17 +156,41 @@ def _service(
         context = replace(context, **context_changes)
     actions = ActionStore(tmp_path / "actions.db")
     secret = "a" * 64
-    authority = FlowSessionAuthority(secret)
+    authority = FlowSessionAuthority(
+        secret,
+        owner_verifier=_VerifiedOwner(),
+        binding_provider=_StableBinding(),
+    )
     if flow_active:
         authenticated_at = int(time.time())
         nonce = "test-action-service-native-proof"
-        owner = "test-owner"
-        message = f"flow-v1\n{nonce}\n{authenticated_at}\n{owner}".encode()
+        challenge = authority.issue_activation_challenge(task_context="task-1")
         authority.activate_flow(
-            nonce=nonce,
-            authenticated_at=authenticated_at,
-            signature=hmac.new(secret.encode(), message, hashlib.sha256).hexdigest(),
-            owner=owner,
+            NativeFlowAssertion(
+                challenge=challenge,
+                nonce=nonce,
+                authenticated_at=authenticated_at,
+                signature=hmac.new(
+                    secret.encode(),
+                    challenge.assertion_message(
+                        nonce=nonce,
+                        authenticated_at=authenticated_at,
+                    ),
+                    hashlib.sha256,
+                ).hexdigest(),
+            )
+        )
+        status = authority.status()
+        assert status.session_id is not None
+        lease = authority.begin_action(
+            session_id=status.session_id,
+            task_context="task-1",
+        )
+        context = replace(
+            context,
+            granted_capabilities=frozenset(
+                (*context.granted_capabilities, lease.grant)
+            ),
         )
     service = ToolActionService(
         catalog=ToolManifestCatalog((manifest,)),
@@ -401,6 +442,58 @@ async def test_retry_is_blocked_after_unknown_effect(tmp_path: Path) -> None:
     actions.transition(failed.action_id, ActionStatus.FAILED, effect_known=False)
     with pytest.raises(ToolActionError, match="unknown"):
         await service.retry(action.action_id)
+    actions.close()
+    task_store.close()
+
+
+@pytest.mark.asyncio
+async def test_flow_action_lease_is_task_bound_and_rechecked_at_execution(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(risk=RiskLevel.DESTRUCTIVE_OR_SENSITIVE)
+    service, _, actions, task_store = _service(tmp_path, manifest)
+    service._context_factory = lambda _proposal: ToolPolicyContext(
+        granted_capabilities=frozenset({manifest.capability}),
+        execution_lane=manifest.allowed_lanes[0],
+        requested_risk=manifest.risk_level,
+        proposal_capability=manifest.capability,
+        allowed_roots=(tmp_path,),
+    )
+    authority = service._flow_authority
+    status = authority.status()
+    assert status.session_id is not None
+    lease = authority.begin_action(
+        session_id=status.session_id,
+        task_context="task-1",
+    )
+
+    action = service.create(
+        _proposal(manifest, idempotency_key="leased-action"),
+        action_lease=lease,
+    )
+    completed = await service.execute(action.action_id, action_lease=lease)
+    assert completed.status is ActionStatus.COMPLETED
+
+    with pytest.raises(ToolActionError, match="task-mismatched"):
+        service.create(
+            _proposal(
+                manifest,
+                task_id="another-task",
+                idempotency_key="wrong-task-lease",
+            ),
+            action_lease=lease,
+        )
+
+    stale = authority.begin_action(
+        session_id=status.session_id,
+        task_context="task-1",
+    )
+    authority.end_action(stale)
+    with pytest.raises(ToolActionError, match="stale"):
+        service.create(
+            _proposal(manifest, idempotency_key="stale-lease"),
+            action_lease=stale,
+        )
     actions.close()
     task_store.close()
 

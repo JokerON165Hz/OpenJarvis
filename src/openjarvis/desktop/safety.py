@@ -81,9 +81,24 @@ class DesktopActionGuard:
         self._owned_processes: set[tuple[int, int]] = set()
 
     def capture_target(self, hwnd: int) -> WindowSnapshot:
+        self._assert_not_stopped()
         snapshot = self._backend.snapshot(hwnd)
         self._assert_interactive(snapshot)
         return snapshot
+
+    def ensure_active(self) -> None:
+        """Fail when a global stop was observed, including after an effect."""
+
+        self._assert_not_stopped()
+
+    def visual_evidence(
+        self, sha256: str, snapshot: WindowSnapshot
+    ) -> VisualEvidence:
+        return VisualEvidence(
+            sha256=sha256,
+            snapshot=snapshot,
+            captured_at=self._backend.now(),
+        )
 
     def request_stop(self) -> None:
         self._stop.set()

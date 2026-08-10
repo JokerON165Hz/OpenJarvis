@@ -149,12 +149,12 @@ export async function fetchFlowStatus(): Promise<FlowStatus> {
   return apiJson<FlowStatus>('/v1/flow/status');
 }
 
-export async function activateFlowMode(): Promise<FlowStatus> {
+export async function activateFlowMode(taskContext: string): Promise<FlowStatus> {
   if (!isTauri()) {
     throw new Error('Flow Mode kann nur in der nativen Desktop-App aktiviert werden.');
   }
   const { invoke } = await import('@tauri-apps/api/core');
-  return invoke<FlowStatus>('activate_flow_mode');
+  return invoke<FlowStatus>('activate_flow_mode', { taskContext });
 }
 
 export async function activateAssistantMode(): Promise<FlowStatus> {
@@ -167,12 +167,30 @@ export async function lockFlowMode(reason = 'user_locked'): Promise<FlowStatus> 
   });
 }
 
-export async function recordFlowActivity(sessionId?: string | null): Promise<FlowStatus> {
+export async function recordFlowActivity(
+  sessionId: string | null | undefined,
+  taskContext: string,
+): Promise<FlowStatus> {
   return apiJson<FlowStatus>('/v1/flow/activity', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session_id: sessionId ?? null }),
+    body: JSON.stringify({ session_id: sessionId ?? null, task_context: taskContext }),
   });
+}
+
+export interface GlobalStopResult {
+  flow: FlowStatus;
+  stopped_components: string[];
+  canceled_task_ids: string[];
+  propagation_failures: string[];
+}
+
+export async function globalStopOperator(): Promise<GlobalStopResult> {
+  if (!isTauri()) {
+    throw new Error('Global Stop kann nur in der nativen Desktop-App ausgelöst werden.');
+  }
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<GlobalStopResult>('global_stop_operator');
 }
 
 export type ApiErrorCategory =

@@ -101,6 +101,10 @@ async def test_factory_wires_only_bounded_runtime_and_guarded_shutdown(
 ) -> None:
     home, vault, config_path = _roots(tmp_path)
     monkeypatch.setenv("OPENJARVIS_HOME", str(home.resolve()))
+    monkeypatch.setattr(
+        "openjarvis.final_runtime._find_chromium_executable",
+        lambda: Path(os.sys.executable).resolve(),
+    )
     write_final_config(
         home=home,
         vault=vault,
@@ -118,7 +122,10 @@ async def test_factory_wires_only_bounded_runtime_and_guarded_shutdown(
         initial_index=False,
     )
 
-    assert runtime.app.state.browser_session_service is None
+    assert runtime.app.state.browser_session_service is not None
+    assert runtime.app.state.desktop_controller.browser_service is (
+        runtime.app.state.browser_session_service
+    )
     assert runtime.app.state.channel_bridge is None
     assert runtime.app.state.analytics_client is None
     assert runtime.app.state.speech_backend.backend_id == "faster-whisper"
@@ -147,7 +154,7 @@ async def test_factory_wires_only_bounded_runtime_and_guarded_shutdown(
                 "local_speech_input": True,
                 "local_voice": True,
                 "analytics": False,
-                "browser": False,
+                "browser": True,
                 "channels": False,
                 "mcp": False,
             }

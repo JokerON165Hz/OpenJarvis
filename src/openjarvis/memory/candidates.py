@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from openjarvis.codex.redaction import redact_data
 from openjarvis.memory.frontmatter import render_canonical_markdown
 from openjarvis.memory.safe_write import (
     AtomicMarkdownWriter,
@@ -143,6 +144,9 @@ class MemoryCandidateWorkflow:
         proposed_path: str | None = None,
         correction: bool = False,
         conflict_key: str | None = None,
+        source: str | None = None,
+        evidence: Mapping[str, Any] | None = None,
+        apply_if_flow: bool = True,
         idempotency_key: str,
     ) -> MemoryCandidate:
         """Create a reviewable candidate without writing Markdown."""
@@ -177,7 +181,11 @@ class MemoryCandidateWorkflow:
         _target, before, before_hash = self.writer.inspect(relative_path)
         if before is not None:
             raise ValueError("candidate target unexpectedly exists")
-        source = "user_correction" if correction else "user"
+        if correction and source not in {None, "user_correction"}:
+            raise ValueError("a correction must use the user_correction source")
+        candidate_source = source or ("user_correction" if correction else "user")
+        if candidate_source not in SOURCE_PRIORITY:
+            raise ValueError(f"unsupported candidate source: {candidate_source}")
         planned = render_canonical_markdown(
             note_id=note_id,
             note_type=note_type,
@@ -185,7 +193,7 @@ class MemoryCandidateWorkflow:
             project=project,
             tags=tuple(tags),
             aliases=tuple(aliases),
-            source=source,
+            source=candidate_source,
             source_task_id=context.task_id,
             source_session_id=context.session_id,
             created_at=timestamp,
@@ -200,15 +208,17 @@ class MemoryCandidateWorkflow:
             conflict_key=conflict_key,
         )
         flow_active = bool(self.flow_authority and self.flow_authority.is_flow())
+        flow_direct = flow_active and apply_if_flow
         risk_level = int(RiskLevel.REVERSIBLE_WORKSPACE)
         metadata = {
             "similar_note_ids": [item.note_id for item in similar.candidates],
             "similar_retrieval_id": similar.retrieval_id,
             "conflict_key": conflict_key,
-            "source_priority": SOURCE_PRIORITY[source],
-            "flow_direct": flow_active,
+            "source_priority": SOURCE_PRIORITY[candidate_source],
+            "flow_direct": flow_direct,
             "thread_id": context.thread_id,
             "turn_id": context.turn_id,
+            "evidence": redact_data(dict(evidence or {})),
         }
         with self._lock, self.index.connection:
             self.index.connection.execute(
@@ -234,7 +244,7 @@ class MemoryCandidateWorkflow:
                     note_type,
                     scope,
                     project,
-                    source,
+                    candidate_source,
                     body,
                     planned,
                     planned_diff,
@@ -280,7 +290,8 @@ class MemoryCandidateWorkflow:
                 "path": relative_path,
                 "risk_level": risk_level,
                 "approval_id": None,
-                "flow_direct": flow_active,
+                "flow_direct": flow_direct,
+                "source": candidate_source,
                 "conflict_state": conflict_state.value,
                 "diff_digest": _stable_id(planned_diff),
             },
@@ -290,7 +301,7 @@ class MemoryCandidateWorkflow:
             raise RuntimeError("candidate could not be read back")
         return (
             self.apply(created.candidate_id)
-            if flow_active
+            if flow_direct
             else created
         )
 

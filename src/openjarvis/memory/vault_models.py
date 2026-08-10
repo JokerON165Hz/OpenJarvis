@@ -64,6 +64,9 @@ SOURCE_PRIORITY: Mapping[str, int] = {
     "manual": 3,
     "verified_import": 2,
     "imported": 2,
+    # Verification proves the tool execution/postcondition, not the semantic
+    # truth of arbitrary content returned by a website or external source.
+    "verified_tool_result": 1,
     "inferred": 1,
     "auto": 1,
     "legacy": 0,

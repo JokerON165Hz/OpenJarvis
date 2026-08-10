@@ -11,7 +11,13 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from openjarvis.flow import FlowSessionAuthority
+from openjarvis.flow import (
+    FlowSessionAuthority,
+    NativeFlowAssertion,
+    OwnerVerificationResult,
+    OwnerVerificationStatus,
+    RuntimeBinding,
+)
 from openjarvis.memory.candidates import MemoryCandidateWorkflow
 from openjarvis.memory.safe_write import AtomicMarkdownWriter
 from openjarvis.memory.task_bridge import MemoryTaskBridge
@@ -25,6 +31,17 @@ from openjarvis.tasks.service import TaskService
 from openjarvis.tasks.store import TaskStore
 from openjarvis.tasks.types import ExecutionLane
 from openjarvis.traces.store import TraceStore
+
+
+class _VerifiedOwner:
+    def verify(self, *, prompt: str) -> OwnerVerificationResult:
+        assert prompt
+        return OwnerVerificationResult(OwnerVerificationStatus.VERIFIED)
+
+
+class _StableBinding:
+    def current(self) -> RuntimeBinding:
+        return RuntimeBinding("memory-api-owner", "memory-api-session", 4242)
 
 
 def _note(
@@ -87,14 +104,24 @@ def api_runtime(tmp_path: Path):
     secret = "f" * 64
     now = 1_800_000_000
     nonce = "memory-api-native-proof"
-    owner = "memory-api-owner"
-    message = f"flow-v1\n{nonce}\n{now}\n{owner}".encode()
-    authority = FlowSessionAuthority(secret, clock=lambda: now)
+    authority = FlowSessionAuthority(
+        secret,
+        clock=lambda: now,
+        owner_verifier=_VerifiedOwner(),
+        binding_provider=_StableBinding(),
+    )
+    challenge = authority.issue_activation_challenge(task_context="task-api")
     authority.activate_flow(
-        nonce=nonce,
-        authenticated_at=now,
-        signature=hmac.new(secret.encode(), message, hashlib.sha256).hexdigest(),
-        owner=owner,
+        NativeFlowAssertion(
+            challenge=challenge,
+            nonce=nonce,
+            authenticated_at=now,
+            signature=hmac.new(
+                secret.encode(),
+                challenge.assertion_message(nonce=nonce, authenticated_at=now),
+                hashlib.sha256,
+            ).hexdigest(),
+        )
     )
     workflow = MemoryCandidateWorkflow(
         index,

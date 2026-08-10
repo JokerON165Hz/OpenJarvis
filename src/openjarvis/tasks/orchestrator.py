@@ -135,6 +135,7 @@ class CodexTaskOrchestrator:
         developer_instructions: str | None = None,
         turn_correlation_id: str | None = None,
         finalize_task: bool = True,
+        action_lease=None,
         _lane_acquired: bool = False,
     ) -> TaskExecutionResult:
         """Execute one turn and apply terminal state only after safety checks."""
@@ -144,7 +145,11 @@ class CodexTaskOrchestrator:
         task = self._tasks.get(task_id)
         if task is None:
             raise KeyError(f"unknown task: {task_id}")
-        policy = self._flow_authority.derive_turn_policy(cwd=cwd)
+        policy = self._flow_authority.derive_turn_policy(
+            cwd=cwd,
+            action_lease=action_lease,
+            task_context=task.task_id,
+        )
         if not _lane_acquired:
             return await self._lanes.run(
                 policy.execution_lane,
@@ -157,6 +162,7 @@ class CodexTaskOrchestrator:
                     developer_instructions=developer_instructions,
                     turn_correlation_id=turn_correlation_id,
                     finalize_task=finalize_task,
+                    action_lease=action_lease,
                     _lane_acquired=True,
                 ),
             )
@@ -275,23 +281,35 @@ class CodexTaskOrchestrator:
                 and current.active_turn_id == turn.turn_id
             ):
                 try:
-                    self._tasks.transition(
-                        task.task_id,
-                        TaskStatus.FAILED,
-                        component="codex_task_orchestrator",
-                        cause="codex_event_stream_failed",
-                        idempotency_key=(
-                            f"{turn_context.correlation_id}:stream-failed"
-                        ),
-                        outcome=TaskOutcome.FAILED,
-                        result=facts.content,
-                        error_category=(
-                            "codex_backend_error"
-                            if isinstance(exc, CodexBackendError)
-                            else "codex_runtime_error"
-                        ),
-                        payload={"error_type": type(exc).__name__},
-                    )
+                    if isinstance(exc, CodexBackendError):
+                        self._tasks.transition(
+                            task.task_id,
+                            TaskStatus.RECOVERING,
+                            component="codex_task_orchestrator",
+                            cause="codex_event_stream_recoverable",
+                            idempotency_key=(
+                                f"{turn_context.correlation_id}:stream-recovering"
+                            ),
+                            result=facts.content,
+                            payload={
+                                "error_category": "codex_backend_error",
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+                    else:
+                        self._tasks.transition(
+                            task.task_id,
+                            TaskStatus.FAILED,
+                            component="codex_task_orchestrator",
+                            cause="codex_event_stream_failed",
+                            idempotency_key=(
+                                f"{turn_context.correlation_id}:stream-failed"
+                            ),
+                            outcome=TaskOutcome.FAILED,
+                            result=facts.content,
+                            error_category="codex_runtime_error",
+                            payload={"error_type": type(exc).__name__},
+                        )
                 except InvalidTaskTransition:
                     pass
             raise

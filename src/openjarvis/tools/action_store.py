@@ -319,6 +319,25 @@ class ActionStore:
             ).fetchall()
         return tuple(ToolAction.model_validate_json(row[0]) for row in rows)
 
+    def list_actions_by_status(
+        self,
+        statuses: frozenset[ActionStatus] | set[ActionStatus],
+    ) -> tuple[ToolAction, ...]:
+        """Return persisted actions in the requested states in stable order."""
+
+        if not statuses:
+            return ()
+        values = tuple(sorted(status.value for status in statuses))
+        placeholders = ", ".join("?" for _value in values)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload_json FROM tool_actions "
+                f"WHERE json_extract(payload_json, '$.status') IN ({placeholders}) "
+                "ORDER BY rowid",
+                values,
+            ).fetchall()
+        return tuple(ToolAction.model_validate_json(row[0]) for row in rows)
+
     def transition(
         self,
         action_id: str,
