@@ -192,23 +192,27 @@ class SystemBuilder:
 
                 from openjarvis.skills.manager import SkillManager
 
+                canonical_skill_mode = bool(config.codex.enabled)
                 skill_manager = SkillManager(
-                    bus, capability_policy=sec.capability_policy
+                    bus,
+                    capability_policy=sec.capability_policy,
+                    canonical_mode=canonical_skill_mode,
                 )
-                skill_paths = [Path(config.skills.skills_dir).expanduser()]
-                workspace_skills = Path("./skills")
-                if workspace_skills.exists():
-                    skill_paths.insert(0, workspace_skills)
-                skill_manager.discover(paths=skill_paths)
-                if tool_executor:
-                    skill_manager.set_tool_executor(tool_executor)
-                skill_tools = skill_manager.get_skill_tools(
-                    tool_executor=tool_executor,
-                )
-                tool_list.extend(skill_tools)
-                if tool_list:
-                    tool_executor = ToolExecutor(tool_list, bus)
-                skill_few_shot_examples = skill_manager.get_few_shot_examples()
+                if not canonical_skill_mode:
+                    skill_paths = [Path(config.skills.skills_dir).expanduser()]
+                    workspace_skills = Path("./skills")
+                    if workspace_skills.exists():
+                        skill_paths.insert(0, workspace_skills)
+                    skill_manager.discover(paths=skill_paths)
+                    if tool_executor:
+                        skill_manager.set_tool_executor(tool_executor)
+                    skill_tools = skill_manager.get_skill_tools(
+                        tool_executor=tool_executor,
+                    )
+                    tool_list.extend(skill_tools)
+                    if tool_list:
+                        tool_executor = ToolExecutor(tool_list, bus)
+                    skill_few_shot_examples = skill_manager.get_few_shot_examples()
             except Exception as exc:
                 logger.warning("Failed to initialize skills: %s", exc)
 
@@ -226,6 +230,30 @@ class SystemBuilder:
                 trace_store = TraceStore(config.traces.db_path)
             except Exception:
                 logger.warning("Failed to initialize TraceStore", exc_info=True)
+
+        task_store = None
+        task_service = None
+        codex_orchestrator = None
+        recovery_coordinator = None
+        approval_broker = None
+        if config.codex.enabled:
+            try:
+                from openjarvis.tasks.runtime import build_codex_task_runtime
+
+                runtime = build_codex_task_runtime(
+                    config.codex,
+                    bus=bus,
+                    trace_store=trace_store,
+                )
+                task_store = runtime.store
+                task_service = runtime.service
+                approval_broker = runtime.approval_broker
+                codex_orchestrator = runtime.orchestrator
+                recovery_coordinator = runtime.recovery
+            except Exception:
+                if task_store is not None:
+                    task_store.close()
+                raise
 
         capability_policy = sec.capability_policy
         learning_orchestrator = self._setup_learning_orchestrator(config)
@@ -309,6 +337,11 @@ class SystemBuilder:
             agent_executor=agent_executor,
             speech_backend=speech_backend,
             skill_manager=skill_manager,
+            task_store=task_store,
+            task_service=task_service,
+            approval_broker=approval_broker,
+            codex_orchestrator=codex_orchestrator,
+            recovery_coordinator=recovery_coordinator,
         )
         system._learning_orchestrator = learning_orchestrator
         system._skill_few_shot_examples = skill_few_shot_examples
@@ -556,6 +589,7 @@ class SystemBuilder:
                 bus=bus,
                 max_parallel=config.workflow.max_parallel,
                 default_node_timeout=config.workflow.default_node_timeout,
+                canonical_mode=bool(config.codex.enabled),
             )
         except Exception as exc:
             logger.warning("Failed to set up workflow engine: %s", exc)

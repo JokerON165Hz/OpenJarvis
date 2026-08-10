@@ -6,9 +6,18 @@ import asyncio
 import inspect
 import json
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -97,6 +106,11 @@ async def list_agents(request: Request):
 @agents_router.post("")
 async def create_agent(req: AgentCreateRequest, request: Request):
     """Spawn a new agent."""
+    if getattr(request.app.state, "tool_action_service", None) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Direct agent mutation is disabled in canonical action mode.",
+        )
     try:
         from openjarvis.tools.agent_tools import AgentSpawnTool
 
@@ -121,6 +135,11 @@ async def create_agent(req: AgentCreateRequest, request: Request):
 @agents_router.delete("/{agent_id}")
 async def kill_agent(agent_id: str, request: Request):
     """Kill a running agent."""
+    if getattr(request.app.state, "tool_action_service", None) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Direct agent mutation is disabled in canonical action mode.",
+        )
     try:
         from openjarvis.tools.agent_tools import AgentKillTool
 
@@ -136,6 +155,11 @@ async def kill_agent(agent_id: str, request: Request):
 @agents_router.post("/{agent_id}/message")
 async def message_agent(agent_id: str, req: AgentMessageRequest, request: Request):
     """Send a message to a running agent."""
+    if getattr(request.app.state, "tool_action_service", None) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Direct agent mutation is disabled in canonical action mode.",
+        )
     try:
         from openjarvis.tools.agent_tools import AgentSendTool
 
@@ -487,6 +511,14 @@ skills_router = APIRouter(prefix="/v1/skills", tags=["skills"])
 async def list_skills(request: Request):
     """List installed skills."""
     try:
+        phase7 = getattr(request.app.state, "phase7_learning_runtime", None)
+        if phase7 is not None:
+            return {
+                "skills": [
+                    phase7.skill_detail(skill_id) for skill_id in phase7.skill_ids()
+                ],
+                "canonical": True,
+            }
         from openjarvis.core.registry import SkillRegistry
 
         skills = []
@@ -878,6 +910,25 @@ async def learning_policy(request: Request):
 
 speech_router = APIRouter(prefix="/v1/speech", tags=["speech"])
 
+_MAX_SPEECH_UPLOAD_BYTES = 10 * 1024 * 1024
+_SPEECH_FORMATS = {"wav", "webm", "mp3", "m4a", "ogg", "flac", "mp4"}
+
+
+class VoiceSynthesisRequest(BaseModel):
+    text: str
+    voice_id: str = ""
+    speed: float = 1.0
+    response_id: str = ""
+
+
+class VoiceSelectionRequest(BaseModel):
+    voice_id: str
+
+
+class VoiceCostLimitsRequest(BaseModel):
+    monthly_char_limit: int
+    per_response_char_limit: int
+
 
 @speech_router.post("/transcribe")
 async def transcribe_speech(request: Request):
@@ -891,26 +942,47 @@ async def transcribe_speech(request: Request):
     if audio_file is None:
         raise HTTPException(status_code=400, detail="Missing 'file' field")
 
-    audio_bytes = await audio_file.read()
-    language = form.get("language")
-
-    # Detect format from filename
-    filename = getattr(audio_file, "filename", "audio.wav")
-    ext = filename.rsplit(".", 1)[-1] if "." in filename else "wav"
-
     try:
+        content_type = str(getattr(audio_file, "content_type", "") or "")
+        if content_type and not (
+            content_type.startswith("audio/")
+            or content_type == "application/octet-stream"
+        ):
+            raise HTTPException(status_code=415, detail="Unsupported audio media type")
+        audio_bytes = await audio_file.read(_MAX_SPEECH_UPLOAD_BYTES + 1)
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="Audio upload is empty")
+        if len(audio_bytes) > _MAX_SPEECH_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Audio upload exceeds 10 MiB")
+        language_value = form.get("language")
+        language = str(language_value or "de")
+        if len(language) > 16:
+            raise HTTPException(status_code=422, detail="Invalid speech language")
+
+        filename = str(getattr(audio_file, "filename", "audio.wav") or "audio.wav")
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "wav"
+        if ext not in _SPEECH_FORMATS:
+            raise HTTPException(status_code=415, detail="Unsupported audio format")
         result = await asyncio.to_thread(
             backend.transcribe,
             audio_bytes,
             format=ext,
-            language=language or None,
+            language=language,
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Speech transcription failed")
         raise HTTPException(
             status_code=500,
-            detail=f"Speech transcription failed: {exc}",
+            detail=f"Speech transcription failed ({type(exc).__name__})",
         ) from exc
+    finally:
+        close = getattr(audio_file, "close", None)
+        if close is not None:
+            result_or_awaitable = close()
+            if inspect.isawaitable(result_or_awaitable):
+                await result_or_awaitable
 
     return {
         "text": result.text,
@@ -920,28 +992,276 @@ async def transcribe_speech(request: Request):
     }
 
 
+def _local_tts(request: Request):
+    backend = getattr(request.app.state, "tts_backend", None)
+    if backend is None or not hasattr(backend, "voice_status"):
+        raise HTTPException(
+            status_code=501, detail="Local voice backend not configured"
+        )
+    return backend
+
+
+@speech_router.post("/synthesize")
+async def synthesize_speech(
+    payload: VoiceSynthesisRequest, request: Request
+) -> Response:
+    """Return one audio chunk through the configured provider fallback chain."""
+
+    from openjarvis.server.task_routes import _require_local
+
+    _require_local(request)
+
+    if not payload.text.strip() or len(payload.text) > 4000:
+        raise HTTPException(
+            status_code=422,
+            detail="Speech text must contain 1 to 4000 characters",
+        )
+    if not 0.75 <= payload.speed <= 1.25:
+        raise HTTPException(
+            status_code=422,
+            detail="Speech speed must be between 0.75 and 1.25",
+        )
+    backend = _local_tts(request)
+    cancellation_event = threading.Event()
+    try:
+        synthesis = asyncio.create_task(
+            asyncio.to_thread(
+                backend.synthesize,
+                payload.text,
+                voice_id=payload.voice_id,
+                speed=payload.speed,
+                output_format="auto",
+                response_id=payload.response_id,
+                cancellation_event=cancellation_event,
+            )
+        )
+        while not synthesis.done():
+            done, _pending = await asyncio.wait({synthesis}, timeout=0.1)
+            if done:
+                break
+            if await request.is_disconnected():
+                cancellation_event.set()
+                try:
+                    await synthesis
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=499, detail="Speech synthesis cancelled"
+                )
+        result = await synthesis
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Local speech synthesis failed")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Local speech synthesis failed ({type(exc).__name__})",
+        ) from exc
+    metadata = result.metadata
+    media_type = "audio/mpeg" if result.format == "mp3" else "audio/wav"
+    return Response(
+        content=result.audio,
+        media_type=media_type,
+        headers={
+            "X-OpenJarvis-Voice": result.voice_id,
+            "X-OpenJarvis-TTS-Backend": str(metadata.get("backend") or "unknown"),
+            "X-OpenJarvis-Cache": "hit" if metadata.get("cache_hit") else "miss",
+            "X-OpenJarvis-Fallback": (
+                "true" if metadata.get("fallback_used") else "false"
+            ),
+            "X-OpenJarvis-TTS-Error": str(metadata.get("primary_error") or "")[:80],
+            "X-OpenJarvis-Synthesis-Ms": str(
+                round(float(metadata.get("synthesis_ms") or 0), 2)
+            ),
+        },
+    )
+
+
+@speech_router.get("/voices")
+async def voice_status(request: Request) -> dict[str, Any]:
+    backend = _local_tts(request)
+    try:
+        return await asyncio.to_thread(backend.voice_status)
+    except Exception as exc:
+        logger.exception("Local voice status failed")
+        raise HTTPException(
+            status_code=503, detail=f"Local voice unavailable ({type(exc).__name__})"
+        ) from exc
+
+
+@speech_router.put("/voices/selected")
+async def select_voice(
+    payload: VoiceSelectionRequest, request: Request
+) -> dict[str, str]:
+    from openjarvis.server.task_routes import _require_local
+
+    _require_local(request)
+    backend = _local_tts(request)
+    try:
+        await asyncio.to_thread(backend.select_voice, payload.voice_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"selected_voice_id": payload.voice_id, "status": "saved"}
+
+
+@speech_router.get("/elevenlabs/voices")
+async def list_elevenlabs_voices(request: Request) -> dict[str, Any]:
+    from openjarvis.server.task_routes import _require_local
+
+    _require_local(request)
+    backend = _local_tts(request)
+    try:
+        voices = await asyncio.to_thread(backend.list_elevenlabs_voices)
+    except Exception as exc:
+        logger.warning("ElevenLabs voice list unavailable: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail=f"ElevenLabs voice list unavailable ({type(exc).__name__})",
+        ) from exc
+    return {"voices": voices}
+
+
+@speech_router.put("/elevenlabs/voice")
+async def select_elevenlabs_voice(
+    payload: VoiceSelectionRequest, request: Request
+) -> dict[str, str]:
+    from openjarvis.server.task_routes import _require_local
+
+    _require_local(request)
+    backend = _local_tts(request)
+    try:
+        selected = await asyncio.to_thread(
+            backend.select_elevenlabs_voice, payload.voice_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning("ElevenLabs voice validation failed: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail=f"ElevenLabs voice validation failed ({type(exc).__name__})",
+        ) from exc
+    return {
+        "voice_id": str(selected["voice_id"]),
+        "name": str(selected.get("name") or ""),
+        "status": "saved",
+    }
+
+
+@speech_router.put("/limits")
+async def update_voice_limits(
+    payload: VoiceCostLimitsRequest, request: Request
+) -> dict[str, int | str]:
+    from openjarvis.server.task_routes import _require_local
+
+    _require_local(request)
+    backend = _local_tts(request)
+    try:
+        config = await asyncio.to_thread(
+            backend.update_cost_limits,
+            monthly_char_limit=payload.monthly_char_limit,
+            per_response_char_limit=payload.per_response_char_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "monthly_char_limit": int(config["monthly_char_limit"]),
+        "per_response_char_limit": int(config["per_response_char_limit"]),
+        "status": "saved",
+    }
+
+
+@speech_router.post("/auditions/generate")
+async def generate_voice_auditions(request: Request) -> dict[str, Any]:
+    from openjarvis.server.task_routes import _require_local
+
+    _require_local(request)
+    backend = _local_tts(request)
+    try:
+        results = await asyncio.to_thread(backend.generate_auditions)
+    except Exception as exc:
+        logger.exception("Voice audition generation failed")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Voice audition generation failed ({type(exc).__name__})",
+        ) from exc
+    return {"status": "ready", "auditions": results}
+
+
+@speech_router.get("/auditions/{voice_id}")
+async def get_voice_audition(voice_id: str, request: Request) -> FileResponse:
+    from openjarvis.server.task_routes import _require_local
+
+    _require_local(request)
+    backend = _local_tts(request)
+    try:
+        path = backend.audition_path(voice_id)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(
+            status_code=404, detail="Audition sample not generated"
+        ) from exc
+    media_type = "audio/mpeg" if path.suffix.lower() == ".mp3" else "audio/wav"
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=f"{voice_id}{path.suffix.lower()}",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @speech_router.get("/health")
 async def speech_health(request: Request):
-    """Check if a speech backend is available."""
+    """Return credential-free STT/TTS provider capabilities."""
     backend = getattr(request.app.state, "speech_backend", None)
-    if backend is None:
-        return {"available": False, "reason": "No speech backend configured"}
+    tts_backend = getattr(request.app.state, "tts_backend", None)
+    config = getattr(request.app.state, "config", None)
+    speech_config = getattr(config, "speech", None)
+    language = str(getattr(speech_config, "language", "de") or "de")
+    available = False
+    reason = None
     try:
-        available = backend.health()
-        reason = None
+        available = bool(
+            backend is not None and await asyncio.to_thread(backend.health)
+        )
     except Exception as exc:
         logger.exception("Speech health check failed")
         available = False
-        reason = str(exc)
+        reason = type(exc).__name__
 
-    if not available and reason is None:
+    if backend is not None and not available and reason is None:
         last_error = getattr(backend, "last_error", None)
         if callable(last_error):
-            reason = last_error()
+            raw_reason = str(last_error() or "")
+            reason = raw_reason[:160] if raw_reason else None
+
+    try:
+        tts_available = bool(
+            tts_backend is not None and await asyncio.to_thread(tts_backend.health)
+        )
+        tts_error = None
+    except Exception as exc:
+        logger.exception("TTS health check failed")
+        tts_available = False
+        tts_error = type(exc).__name__
+
+    backend_id = str(getattr(backend, "backend_id", "disabled"))
+    tts_backend_id = str(getattr(tts_backend, "backend_id", "disabled"))
+    cloud_ids = {"openai", "deepgram", "openai_tts", "cartesia"}
+    degraded = bool(reason or tts_error)
 
     return {
         "available": available,
-        "backend": backend.backend_id,
+        "backend": backend_id,
+        "stt_available": available,
+        "tts_available": tts_available,
+        "stt_provider": backend_id,
+        "tts_provider": tts_backend_id,
+        "stt_location": "external" if backend_id in cloud_ids else "local",
+        "tts_location": "external" if tts_backend_id in cloud_ids else "local",
+        "language": language,
+        "microphone_permission": "client",
+        "degraded": degraded,
+        "last_error": reason or tts_error,
         **({"reason": reason} if reason else {}),
     }
 
@@ -1046,11 +1366,29 @@ async def start_optimize_run(req: OptimizeRunRequest, request: Request):
 
 def include_all_routes(app) -> None:
     """Include all extended API routers in a FastAPI app."""
-    from openjarvis.server.approval_routes import (
-        router as approval_router,  # noqa: PLC0415
+    from openjarvis.server.desktop_routes import (
+        router as desktop_router,  # noqa: PLC0415
+    )
+    from openjarvis.server.flow_routes import router as flow_router  # noqa: PLC0415
+    from openjarvis.server.mcp_routes import router as mcp_router  # noqa: PLC0415
+    from openjarvis.server.memory_vault_routes import (  # noqa: PLC0415
+        router as memory_vault_router,
+    )
+    from openjarvis.server.system_health_routes import (  # noqa: PLC0415
+        router as system_health_router,
+    )
+    from openjarvis.server.task_routes import router as task_router  # noqa: PLC0415
+    from openjarvis.server.tool_browser_routes import (  # noqa: PLC0415
+        router as tool_browser_router,
     )
 
-    app.include_router(approval_router)
+    app.include_router(desktop_router)
+    app.include_router(flow_router)
+    app.include_router(mcp_router)
+    app.include_router(task_router)
+    app.include_router(system_health_router)
+    app.include_router(tool_browser_router)
+    app.include_router(memory_vault_router)
     app.include_router(agents_router)
     app.include_router(memory_router)
     app.include_router(traces_router)
@@ -1092,7 +1430,15 @@ def include_all_routes(app) -> None:
         from openjarvis.core.events import get_event_bus
         from openjarvis.server.ws_bridge import create_ws_router
 
-        ws_router = create_ws_router(get_event_bus())
+        ws_router = create_ws_router(
+            app.state.bus or get_event_bus(),
+            task_service=getattr(app.state, "task_service", None),
+        )
+        app.state.websocket_shutdown = getattr(
+            ws_router,
+            "openjarvis_shutdown",
+            None,
+        )
         app.include_router(ws_router)
     except Exception:
         logger.debug("WebSocket bridge not available", exc_info=True)

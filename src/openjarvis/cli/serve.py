@@ -681,6 +681,53 @@ def serve(
         except Exception as exc:
             logger.debug("ChannelBridge init skipped: %s", exc)
 
+    codex_runtime = None
+    codex_trace_store = None
+    if config.codex.enabled:
+        try:
+            if config.traces.enabled:
+                from openjarvis.traces.store import TraceStore
+
+                codex_trace_store = TraceStore(config.traces.db_path)
+            from openjarvis.tasks.runtime import build_codex_task_runtime
+
+            codex_runtime = build_codex_task_runtime(
+                config.codex,
+                bus=bus,
+                trace_store=codex_trace_store,
+            )
+            console.print("  Codex: [cyan]task runtime active[/cyan]")
+        except Exception as exc:
+            logger.error("Codex task runtime failed to initialize: %s", exc)
+            raise
+
+    vault_memory_service = None
+    try:
+        from openjarvis.memory import build_vault_memory_service
+
+        vault_memory_service = build_vault_memory_service(
+            config,
+            task_store=(codex_runtime.store if codex_runtime is not None else None),
+            trace_store=codex_trace_store,
+        )
+        if vault_memory_service is not None:
+            console.print("  Vault memory: [cyan]active[/cyan]")
+    except Exception as exc:
+        logger.error("Vault memory failed to initialize: %s", exc)
+        raise
+
+    phase7_learning_runtime = None
+    try:
+        from openjarvis.learning.runtime import Phase7LearningRuntime
+
+        phase7_learning_runtime = Phase7LearningRuntime.create(
+            (get_config_dir() / "phase7-learning.sqlite3").resolve()
+        )
+        console.print("  Phase-7 learning: [cyan]shadow/review active[/cyan]")
+    except Exception as exc:
+        logger.error("Phase-7 learning runtime failed to initialize: %s", exc)
+        raise
+
     app = create_app(
         engine,
         model_name,
@@ -692,9 +739,24 @@ def serve(
         config=config,
         memory_backend=memory_backend,
         memory_service=memory_service,
+        vault_memory_service=vault_memory_service,
         speech_backend=speech_backend,
         agent_manager=agent_manager,
         agent_scheduler=agent_scheduler,
+        trace_store=codex_trace_store,
+        task_store=(codex_runtime.store if codex_runtime is not None else None),
+        task_service=(codex_runtime.service if codex_runtime is not None else None),
+        approval_broker=(
+            codex_runtime.approval_broker if codex_runtime is not None else None
+        ),
+        codex_orchestrator=(
+            codex_runtime.orchestrator if codex_runtime is not None else None
+        ),
+        recovery_coordinator=(
+            codex_runtime.recovery if codex_runtime is not None else None
+        ),
+        phase7_learning_runtime=phase7_learning_runtime,
+        owns_task_runtime=codex_runtime is not None,
         api_key=api_key,
         webhook_config=webhook_config,
         cors_origins=config.server.cors_origins,

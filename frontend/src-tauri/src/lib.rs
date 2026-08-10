@@ -5,9 +5,29 @@ use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Mutex;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 const OLLAMA_PORT: u16 = 11434;
 const JARVIS_PORT: u16 = 8000;
+const FINAL_HEALTH_MARKER: &str = "OPENJARVIS-FINAL-RUNTIME";
+const FINAL_RUNTIME_NAME: &str = "phase8-final";
+const FLOW_BRIDGE_SECRET_ENV: &str = "OPENJARVIS_FLOW_BRIDGE_SECRET";
+const FINAL_ATTACH_ERROR: &str = "OpenJarvis Codex Runtime ist nicht erreichbar.";
+const FINAL_ATTACH_SERVICE_WORKER_RECOVERY: &str = r#"
+(() => {
+  if (!("serviceWorker" in navigator)) return;
+  navigator.serviceWorker.getRegistrations().then(async (registrations) => {
+    if (registrations.length === 0) return;
+    await Promise.all(registrations.map((registration) => registration.unregister()));
+    const reloadKey = "openjarvis-final-service-worker-recovered";
+    if (navigator.serviceWorker.controller && !sessionStorage.getItem(reloadKey)) {
+      sessionStorage.setItem(reloadKey, "1");
+      window.location.reload();
+    }
+  });
+})();
+"#;
 const DESKTOP_UV_SYNC_COMMAND: &str =
     "uv sync --extra desktop --extra inference-cloud --extra inference-google --group desktop-native";
 
@@ -418,7 +438,7 @@ struct SetupStatus {
     server_ready: bool,
     model_ready: bool,
     error: Option<String>,
-    /// "ollama" | "custom" — lets the setup UI relabel the progress steps.
+    /// "ollama" | "custom" | "codex" — lets the UI relabel progress steps.
     source: String,
 }
 
@@ -437,6 +457,80 @@ impl Default for SetupStatus {
 }
 
 type SharedStatus = Arc<Mutex<SetupStatus>>;
+
+#[derive(Clone)]
+struct FlowBridgeSecret(String);
+
+fn final_attach_only() -> bool {
+    final_attach_only_value(std::env::var("OPENJARVIS_FINAL_ATTACH_ONLY").ok().as_deref())
+}
+
+fn final_attach_only_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn inherited_flow_bridge_secret(
+    attach_only: bool,
+    value: Option<&str>,
+) -> Option<String> {
+    let secret = value.unwrap_or_default().trim();
+    (attach_only && secret.len() >= 32).then(|| secret.to_owned())
+}
+
+fn initial_setup_status() -> SetupStatus {
+    let mut status = SetupStatus::default();
+    if final_attach_only() {
+        status.phase = "server".into();
+        status.detail = "Attaching to Codex runtime...".into();
+        status.source = "codex".into();
+    }
+    status
+}
+
+fn valid_final_health(body: &serde_json::Value) -> bool {
+    body.get("marker").and_then(|value| value.as_str()) == Some(FINAL_HEALTH_MARKER)
+        && body.get("runtime").and_then(|value| value.as_str()) == Some(FINAL_RUNTIME_NAME)
+        && body.get("status").and_then(|value| value.as_str()) == Some("ready")
+        && body.get("backend").and_then(|value| value.as_str()) == Some("python_sdk")
+}
+
+/// Attach to one already-owned final backend. This path never launches a
+/// model, process, clone, dependency sync, updater, or non-loopback URL.
+async fn attach_final_backend(status: SharedStatus) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|error| format!("could not build local health client: {error}"))?;
+    let url = format!("http://127.0.0.1:{JARVIS_PORT}/v1/final/health");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(response) = client.get(&url).send().await {
+            if response.status().is_success() {
+                if let Ok(body) = response.json::<serde_json::Value>().await {
+                    if valid_final_health(&body) {
+                        let mut current = status.lock().await;
+                        current.phase = "ready".into();
+                        current.detail = "Codex runtime ready.".into();
+                        current.ollama_ready = true;
+                        current.server_ready = true;
+                        current.model_ready = true;
+                        current.source = "codex".into();
+                        current.error = None;
+                        return Ok(());
+                    }
+                    return Err(
+                        "local server did not provide the exact final runtime marker".into(),
+                    );
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("timed out waiting for the owned final runtime".into());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Health-check helpers
@@ -916,7 +1010,27 @@ fn check_jarvis_port_available() -> Result<(), String> {
 // Backend boot sequence (runs in background after app launch)
 // ---------------------------------------------------------------------------
 
-async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
+async fn boot_backend(
+    backend: SharedBackend,
+    status: SharedStatus,
+    flow_bridge_secret: String,
+) {
+    if final_attach_only() {
+        {
+            let mut current = status.lock().await;
+            current.phase = "server".into();
+            current.detail = "Attaching to Codex runtime...".into();
+            current.source = "codex".into();
+        }
+        if let Err(error) = attach_final_backend(status.clone()).await {
+            eprintln!("Final Codex runtime attach failed: {error}");
+            let mut current = status.lock().await;
+            current.phase = "error".into();
+            current.error = Some(FINAL_ATTACH_ERROR.into());
+        }
+        return;
+    }
+
     // Decide the inference source (default Ollama) before launching anything.
     let cfg = read_inference_config();
     let plan = boot_plan(&cfg, total_ram_gb());
@@ -1421,6 +1535,7 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .current_dir(root);
+    cmd.env(FLOW_BRIDGE_SECRET_ENV, &flow_bridge_secret);
     // Avoid LD_LIBRARY_PATH leak when running inside an AppImage (#455) —
     // do this BEFORE cmd.env() calls below so our explicit cloud-key env
     // additions aren't accidentally stripped.
@@ -1571,10 +1686,11 @@ fn get_api_base() -> String {
 async fn start_backend(
     backend: tauri::State<'_, SharedBackend>,
     status: tauri::State<'_, SharedStatus>,
+    flow_bridge: tauri::State<'_, FlowBridgeSecret>,
 ) -> Result<(), String> {
     let b = backend.inner().clone();
     let s = status.inner().clone();
-    tauri::async_runtime::spawn(boot_backend(b, s));
+    tauri::async_runtime::spawn(boot_backend(b, s, flow_bridge.0.clone()));
     Ok(())
 }
 
@@ -1582,6 +1698,143 @@ async fn start_backend(
 async fn stop_backend(backend: tauri::State<'_, SharedBackend>) -> Result<(), String> {
     backend.lock().await.stop_all().await;
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn native_owner_verification() -> Result<String, String> {
+    use windows::core::HSTRING;
+    use windows::Security::Credentials::UI::{
+        UserConsentVerificationResult, UserConsentVerifier,
+    };
+
+    let operation = UserConsentVerifier::RequestVerificationAsync(&HSTRING::from(
+        "OpenJarvis Flow Mode aktivieren",
+    ))
+    .map_err(|error| format!("Windows Hello konnte nicht gestartet werden: {error}"))?;
+    let result = operation
+        .await
+        .map_err(|error| format!("Windows Hello ist fehlgeschlagen: {error}"))?;
+    if result != UserConsentVerificationResult::Verified {
+        return Err(format!("Windows-Anmeldung wurde nicht bestätigt: {result:?}"));
+    }
+    Ok(std::env::var("USERNAME").unwrap_or_else(|_| "windows-owner".into()))
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn native_owner_verification() -> Result<String, String> {
+    Err("Flow-Aktivierung ist derzeit nur unter Windows verfügbar".into())
+}
+
+#[tauri::command]
+async fn activate_flow_mode(
+    flow_bridge: tauri::State<'_, FlowBridgeSecret>,
+    task_context: String,
+) -> Result<serde_json::Value, String> {
+    if task_context.trim().is_empty() || task_context.len() > 1024 {
+        return Err("Flow task context is invalid".into());
+    }
+    let client = reqwest::Client::new();
+    let challenge_response = client
+        .post(format!("{}/v1/flow/challenge", api_base()))
+        .header("X-OpenJarvis-Native-Bridge", "tauri")
+        .json(&serde_json::json!({"task_context": task_context}))
+        .send()
+        .await
+        .map_err(|error| format!("Flow backend is unavailable: {error}"))?;
+    let challenge_status = challenge_response.status();
+    let challenge = challenge_response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("Invalid Flow challenge: {error}"))?;
+    if !challenge_status.is_success() {
+        return Err(challenge
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Flow challenge failed")
+            .to_string());
+    }
+
+    native_owner_verification().await?;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let authenticated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs();
+    let mut signed = std::collections::BTreeMap::<String, serde_json::Value>::new();
+    for key in [
+        "bridge_generation",
+        "challenge_id",
+        "expires_at",
+        "issued_at",
+        "os_session_id",
+        "owner",
+        "process_id",
+        "process_nonce",
+        "task_context_digest",
+    ] {
+        signed.insert(
+            key.to_string(),
+            challenge
+                .get(key)
+                .cloned()
+                .ok_or_else(|| format!("Flow challenge field is missing: {key}"))?,
+        );
+    }
+    signed.insert("authenticated_at".into(), authenticated_at.into());
+    signed.insert("nonce".into(), nonce.clone().into());
+    signed.insert("owner_verification".into(), "verified".into());
+    signed.insert("version".into(), 2.into());
+    let message = serde_json::to_string(&signed)
+        .map_err(|error| format!("Flow assertion could not be encoded: {error}"))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(flow_bridge.0.as_bytes())
+        .map_err(|_| "native Flow bridge secret is invalid".to_string())?;
+    mac.update(message.as_bytes());
+    let signature = hex::encode(mac.finalize().into_bytes());
+    let response = client
+        .post(format!("{}/v1/flow/activate", api_base()))
+        .header("X-OpenJarvis-Native-Bridge", "tauri")
+        .json(&serde_json::json!({
+            "challenge": challenge,
+            "nonce": nonce,
+            "authenticated_at": authenticated_at,
+            "signature": signature,
+            "owner_verification": "verified",
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Flow backend is unavailable: {error}"))?;
+    let status = response.status();
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("Invalid Flow response: {error}"))?;
+    if !status.is_success() {
+        return Err(payload.get("detail").and_then(|v| v.as_str()).unwrap_or("Flow activation failed").to_string());
+    }
+    Ok(payload)
+}
+
+#[tauri::command]
+async fn global_stop_operator() -> Result<serde_json::Value, String> {
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/flow/global-stop", api_base()))
+        .header("X-OpenJarvis-Native-Bridge", "tauri")
+        .send()
+        .await
+        .map_err(|error| format!("Global Stop backend is unavailable: {error}"))?;
+    let status = response.status();
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("Invalid Global Stop response: {error}"))?;
+    if !status.is_success() {
+        return Err(payload
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Global Stop failed")
+            .to_string());
+    }
+    Ok(payload)
 }
 
 #[tauri::command]
@@ -1760,7 +2013,7 @@ async fn fetch_models(api_url: String) -> Result<serde_json::Value, String> {
         .map_err(|e| format!("Invalid response: {}", e))
 }
 
-#[tauri::command]
+#[cfg(any())]
 async fn run_jarvis_command(args: Vec<String>) -> Result<String, String> {
     let uv_bin = resolve_bin("uv");
 
@@ -1951,6 +2204,7 @@ const MANAGED_CLOUD_KEY_NAMES: &[&str] = &[
     "OPENROUTER_API_KEY",
     "MINIMAX_API_KEY",
     "TAVILY_API_KEY",
+    "ELEVENLABS_API_KEY",
 ];
 
 /// Legacy path used by older desktop builds. New saves never write here.
@@ -1995,11 +2249,57 @@ fn engine_api_key_name(engine: &str) -> String {
     format!("{}_API_KEY", engine_name)
 }
 
+/// Non-secret inventory needed because platform keyrings cannot enumerate keys.
+fn managed_dynamic_key_names_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(home_dir())
+        .join(".openjarvis")
+        .join("managed-key-names.json")
+}
+
+fn read_managed_dynamic_key_names() -> Vec<String> {
+    let path = managed_dynamic_key_names_path();
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(&contents)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|key| key.starts_with("MCP_") && validate_cloud_key_name(key).is_ok())
+        .collect()
+}
+
+fn update_managed_dynamic_key_name(key_name: &str, present: bool) -> Result<(), String> {
+    if !key_name.starts_with("MCP_") {
+        return Ok(());
+    }
+    validate_cloud_key_name(key_name)?;
+    let path = managed_dynamic_key_names_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to prepare secure key inventory: {}", err))?;
+    }
+    let mut names = read_managed_dynamic_key_names();
+    names.retain(|value| value != key_name);
+    if present {
+        names.push(key_name.to_string());
+    }
+    names.sort();
+    names.dedup();
+    let payload = serde_json::to_vec_pretty(&names)
+        .map_err(|err| format!("Failed to encode secure key inventory: {}", err))?;
+    // The inventory contains key names only; key values stay in the platform
+    // keyring. A direct write is used because std::fs::rename does not replace
+    // an existing destination reliably on Windows.
+    std::fs::write(&path, payload)
+        .map_err(|err| format!("Failed to save secure key inventory: {}", err))
+}
+
 fn managed_cloud_key_names() -> Vec<String> {
     let mut names: Vec<String> = MANAGED_CLOUD_KEY_NAMES
         .iter()
         .map(|name| (*name).to_string())
         .collect();
+    names.extend(read_managed_dynamic_key_names());
 
     let cfg = read_inference_config();
     if matches!(&cfg.kind, SourceKind::Custom) {
@@ -2120,6 +2420,7 @@ async fn reload_cloud_keys(keys: Vec<(String, String)>) {
 async fn save_cloud_key(key_name: String, key_value: String) -> Result<(), String> {
     let key_value = key_value.trim().to_string();
     secure_store_set(&key_name, &key_value)?;
+    update_managed_dynamic_key_name(&key_name, !key_value.is_empty())?;
 
     // Tell the running server to hot-reload its cloud engine so the user
     // doesn't need to restart the app after entering an API key.
@@ -2728,16 +3029,30 @@ async fn hide_overlay() -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let backend: SharedBackend = Arc::new(Mutex::new(BackendManager::default()));
-    let status: SharedStatus = Arc::new(Mutex::new(SetupStatus::default()));
+    let status: SharedStatus = Arc::new(Mutex::new(initial_setup_status()));
+    let flow_bridge = FlowBridgeSecret(
+        inherited_flow_bridge_secret(
+            final_attach_only(),
+            std::env::var(FLOW_BRIDGE_SECRET_ENV).ok().as_deref(),
+        )
+        .unwrap_or_else(|| {
+            format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            )
+        }),
+    );
 
     let boot_backend_ref = backend.clone();
     let boot_status_ref = status.clone();
+    let boot_flow_secret = flow_bridge.0.clone();
 
     tauri::Builder::default()
         .manage(backend.clone())
         .manage(status.clone())
+        .manage(flow_bridge)
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -2751,7 +3066,18 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        .on_window_event(|window, event| {
+            if final_attach_only() && matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                window.app_handle().exit(0);
+            }
+        })
         .setup(move |app| {
+            if final_attach_only() {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.eval(FINAL_ATTACH_SERVICE_WORKER_RECOVERY)?;
+                }
+            }
+
             // System tray
             let show = MenuItemBuilder::with_id("show", "Show / Hide").build(app)?;
             let health = MenuItemBuilder::with_id("health", "Health: starting...")
@@ -2814,7 +3140,11 @@ pub fn run() {
             }
 
             // Auto-start backend services on launch
-            tauri::async_runtime::spawn(boot_backend(boot_backend_ref, boot_status_ref));
+            tauri::async_runtime::spawn(boot_backend(
+                boot_backend_ref,
+                boot_status_ref,
+                boot_flow_secret,
+            ));
 
             Ok(())
         })
@@ -2823,6 +3153,8 @@ pub fn run() {
             get_api_base,
             start_backend,
             stop_backend,
+            activate_flow_mode,
+            global_stop_operator,
             check_health,
             fetch_energy,
             fetch_telemetry,
@@ -2834,7 +3166,6 @@ pub fn run() {
             search_memory,
             fetch_agents,
             fetch_models,
-            run_jarvis_command,
             fetch_savings,
             submit_savings,
             transcribe_audio,
@@ -2868,14 +3199,59 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        boot_plan, default_local_model, format_extension_import_failure,
+        boot_plan, default_local_model, final_attach_only_value, format_extension_import_failure,
         format_missing_rust_toolchain, format_port_unavailable, format_uv_sync_failure,
-        format_uv_sync_spawn_error, matching_installed_model, model_names_match, normalize_host,
-        parse_inference_config, parse_ollama_model_names, preferred_installed_model,
-        should_persist_resolved_model, startup_installed_model, upsert_engine_host,
-        uv_sync_stderr_tail, InferenceConfig, SourceKind, DESKTOP_UV_SYNC_COMMAND,
+        format_uv_sync_spawn_error, inherited_flow_bridge_secret, matching_installed_model,
+        model_names_match, normalize_host, parse_inference_config, parse_ollama_model_names,
+        preferred_installed_model, should_persist_resolved_model, startup_installed_model,
+        upsert_engine_host, uv_sync_stderr_tail, valid_final_health, InferenceConfig, SourceKind,
+        DESKTOP_UV_SYNC_COMMAND, FINAL_ATTACH_ERROR, FINAL_HEALTH_MARKER, FINAL_RUNTIME_NAME,
     };
     use std::path::Path;
+
+    #[test]
+    fn final_health_requires_exact_runtime_identity() {
+        let valid = serde_json::json!({
+            "marker": FINAL_HEALTH_MARKER,
+            "runtime": FINAL_RUNTIME_NAME,
+            "status": "ready",
+            "backend": "python_sdk",
+        });
+        assert!(valid_final_health(&valid));
+        assert!(!valid_final_health(&serde_json::json!({"status": "ready"})));
+        let mut wrong_marker = valid.clone();
+        wrong_marker["marker"] = serde_json::json!("some-other-server");
+        assert!(!valid_final_health(&wrong_marker));
+        let mut wrong_backend = valid;
+        wrong_backend["backend"] = serde_json::json!("ollama");
+        assert!(!valid_final_health(&wrong_backend));
+    }
+
+    #[test]
+    fn final_attach_mode_requires_exact_opt_in_and_has_bounded_error() {
+        assert!(final_attach_only_value(Some("1")));
+        assert!(!final_attach_only_value(None));
+        assert!(!final_attach_only_value(Some("0")));
+        assert!(!final_attach_only_value(Some("true")));
+        assert_eq!(
+            FINAL_ATTACH_ERROR,
+            "OpenJarvis Codex Runtime ist nicht erreichbar."
+        );
+    }
+
+    #[test]
+    fn final_attach_reuses_only_a_valid_inherited_flow_bridge_secret() {
+        let secret = "f".repeat(64);
+        assert_eq!(
+            inherited_flow_bridge_secret(true, Some(&secret)),
+            Some(secret)
+        );
+        assert_eq!(inherited_flow_bridge_secret(true, Some("short")), None);
+        assert_eq!(
+            inherited_flow_bridge_secret(false, Some(&"f".repeat(64))),
+            None
+        );
+    }
 
     #[test]
     fn tail_returns_whole_string_when_shorter_than_limit() {

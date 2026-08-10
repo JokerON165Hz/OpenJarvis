@@ -26,6 +26,10 @@ class SkillResult:
 SkillResolver = Callable[[str, Dict[str, Any]], SkillResult]
 
 
+class LegacySkillExecutionBlocked(RuntimeError):
+    """Legacy execution is unavailable inside the canonical Jarvis runtime."""
+
+
 class SkillExecutor:
     """Execute a skill manifest step-by-step.
 
@@ -38,10 +42,12 @@ class SkillExecutor:
         tool_executor: ToolExecutor,
         *,
         bus: Optional[EventBus] = None,
+        canonical_mode: bool = False,
         allowed_capabilities: Optional[Set[str]] = None,
     ) -> None:
         self._tool_executor = tool_executor
         self._bus = bus
+        self._canonical_mode = canonical_mode
         self._skill_resolver: Optional[SkillResolver] = None
         # None means "no capability policy" — every skill runs, matching the
         # behavior before capability enforcement existed. Pass a set (even an
@@ -60,6 +66,11 @@ class SkillExecutor:
         initial_context: Optional[Dict[str, Any]] = None,
     ) -> SkillResult:
         """Execute all steps in a skill manifest."""
+        if self._canonical_mode:
+            raise LegacySkillExecutionBlocked(
+                "legacy SkillExecutor is blocked in canonical mode"
+            )
+
         missing = (
             validate_capabilities(manifest, self._allowed_capabilities)
             if self._allowed_capabilities is not None
@@ -216,4 +227,9 @@ class SkillExecutor:
         return re.sub(r"\{(\w+)\}", _replace, template)
 
 
-__all__ = ["SkillExecutor", "SkillResolver", "SkillResult"]
+__all__ = [
+    "LegacySkillExecutionBlocked",
+    "SkillExecutor",
+    "SkillResolver",
+    "SkillResult",
+]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from pathlib import Path
 from typing import List, Optional
 
 from openjarvis.core.registry import SpeechRegistry
@@ -34,10 +35,16 @@ class FasterWhisperBackend(SpeechBackend):
         model_size: str = "base",
         device: str = "auto",
         compute_type: str = "float16",
+        download_root: str | None = None,
     ) -> None:
         self._model_size = model_size
         self._device = device
         self._compute_type = compute_type
+        self._download_root = (
+            str(Path(download_root).expanduser().resolve(strict=False))
+            if download_root
+            else None
+        )
         self._model: Optional[WhisperModel] = None
         self._last_error: Optional[str] = None
 
@@ -87,11 +94,13 @@ class FasterWhisperBackend(SpeechBackend):
                 )
                 raise ImportError(self._last_error)
             compute_type = self._resolve_compute_type()
-            self._model = WhisperModel(
-                self._model_size,
-                device=self._device,
-                compute_type=compute_type,
-            )
+            model_kwargs = {
+                "device": self._device,
+                "compute_type": compute_type,
+            }
+            if self._download_root:
+                model_kwargs["download_root"] = self._download_root
+            self._model = WhisperModel(self._model_size, **model_kwargs)
         self._last_error = None
         return self._model
 

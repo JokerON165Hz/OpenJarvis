@@ -27,6 +27,7 @@ from openjarvis.server.models import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _to_messages(chat_messages) -> list[Message]:
@@ -242,6 +243,20 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     # tools (e.g. injecting MCP tools through this endpoint and wanting
     # the agent to execute them), add an explicit opt-in header rather
     # than removing this guard — silent re-routing is what produced #414.
+    if (
+        agent is not None
+        and not request_body.tools
+        and getattr(agent, "_executor", None) is not None
+        and getattr(request.app.state, "tool_action_service", None) is not None
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Legacy agent tool execution is disabled; use /v1/chat so "
+                "ToolActionService owns policy, approval, and verification."
+            ),
+        )
+
     # ``_handle_agent`` (sync ``agent.run()``) and ``_handle_direct`` (sync
     # ``engine.generate()``) both make blocking upstream calls; run them in a
     # worker thread so a slow/wedged non-streaming request can't stall the
@@ -940,6 +955,10 @@ async def reload_cloud_engine(request: Request):
     """
     import os
 
+    from openjarvis.server.task_routes import _require_local
+
+    _require_local(request)
+
     submitted_keys: dict[str, str] | None = None
     try:
         body = await request.json()
@@ -959,6 +978,16 @@ async def reload_cloud_engine(request: Request):
                 os.environ[key] = value
             else:
                 os.environ.pop(key, None)
+        mcp_key_names = {
+            key for key in submitted_keys if key.startswith("MCP_")
+        }
+        registry = getattr(request.app.state, "mcp_server_registry", None)
+        if registry is not None and mcp_key_names:
+            from openjarvis.mcp.action_bridge import disconnect_server
+
+            for record in registry.list():
+                if record.token_env in mcp_key_names:
+                    disconnect_server(request.app.state, record.server_id)
     else:
         # Compatibility fallback for non-desktop/manual configurations.
         keys_path = get_config_dir() / "cloud-keys.env"
@@ -968,6 +997,12 @@ async def reload_cloud_engine(request: Request):
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     os.environ[k.strip()] = v.strip()
+
+    # The isolated voice worker inherits environment variables only at start.
+    # Restart it after secure-key updates without ever returning key material.
+    tts_backend = getattr(request.app.state, "tts_backend", None)
+    if tts_backend is not None and hasattr(tts_backend, "close"):
+        await asyncio.to_thread(tts_backend.close)
 
     # Try to build a fresh CloudEngine.
     try:
@@ -981,7 +1016,11 @@ async def reload_cloud_engine(request: Request):
                 "message": "No cloud models available (check API keys)",
             }
     except Exception as exc:
-        return {"status": "error", "message": str(exc)}
+        logger.warning("Cloud key reload failed (%s)", type(exc).__name__)
+        return {
+            "status": "error",
+            "message": "Cloud provider could not be reloaded",
+        }
 
     # Locate the innermost engine, working through InstrumentedEngine layers.
     outer = request.app.state.engine
