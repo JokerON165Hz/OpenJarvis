@@ -16,7 +16,7 @@ from openjarvis.codex.redaction import redact_data
 from openjarvis.tasks.lanes import ExecutionLaneScheduler
 from openjarvis.tasks.policy import ToolPolicyContext, ToolPolicyDecision
 from openjarvis.tasks.service import TaskService
-from openjarvis.tools.action_store import ActionStore
+from openjarvis.tools.action_store import ActionStore, ActionStoreError
 from openjarvis.tools.actions import (
     ActionStatus,
     ToolAction,
@@ -84,6 +84,7 @@ class ToolActionService:
         self._artifact_root.mkdir(parents=True, exist_ok=True)
         self._inline_output_limit = inline_output_limit
         self._locks: dict[str, asyncio.Lock] = {}
+        self._registry_lock = threading.RLock()
         self._interrupt_lock = threading.RLock()
         self._interrupted_tasks: set[str] = set()
         self._active_runtimes: dict[str, tuple[str, RegisteredToolRuntime]] = {}
@@ -93,7 +94,8 @@ class ToolActionService:
         return self._lanes
 
     def runtime_available(self, tool_id: str) -> bool:
-        return tool_id in self._runtimes
+        with self._registry_lock:
+            return tool_id in self._runtimes
 
     def policy_context(self, proposal: ToolProposal) -> ToolPolicyContext:
         """Expose the trusted context for additional code-owned root binding."""
@@ -107,13 +109,14 @@ class ToolActionService:
     ) -> None:
         """Bind one trusted startup runtime without exposing model registration."""
 
-        self.catalog.register(manifest)
-        existing = self._runtimes.get(manifest.tool_id)
-        if existing is not None and existing is not runtime:
-            raise ToolActionError(
-                f"tool runtime is already registered: {manifest.tool_id}"
-            )
-        self._runtimes[manifest.tool_id] = runtime
+        with self._registry_lock:
+            self.catalog.register(manifest)
+            existing = self._runtimes.get(manifest.tool_id)
+            if existing is not None and existing is not runtime:
+                raise ToolActionError(
+                    f"tool runtime is already registered: {manifest.tool_id}"
+                )
+            self._runtimes[manifest.tool_id] = runtime
 
     def refresh_runtime(
         self,
@@ -122,46 +125,53 @@ class ToolActionService:
     ) -> None:
         """Refresh a reconnectable runtime only when its manifest is unchanged."""
 
-        existing = self.catalog.get(manifest.tool_id)
-        if existing != manifest:
-            raise ToolActionError(
-                f"tool manifest changed during runtime refresh: {manifest.tool_id}"
-            )
-        self._runtimes[manifest.tool_id] = runtime
+        with self._registry_lock:
+            existing = self.catalog.get(manifest.tool_id)
+            if existing != manifest:
+                raise ToolActionError(
+                    f"tool manifest changed during runtime refresh: {manifest.tool_id}"
+                )
+            self._runtimes[manifest.tool_id] = runtime
 
     def replace_runtime_policy(
         self,
         manifest: ToolManifest,
         runtime: RegisteredToolRuntime,
     ) -> None:
-        """Apply a trusted local policy change without accepting schema drift."""
+        """Apply a trusted local policy change without accepting schema drift.
 
-        existing = self.catalog.get(manifest.tool_id)
-        mutable_policy_fields = {
-            "risk_level",
-            "side_effect_class",
-            "required_approval",
-            "idempotency_policy",
-            "undo_strategy",
-            "enabled",
-            "degraded_reason",
-        }
-        if existing.model_dump(exclude=mutable_policy_fields) != manifest.model_dump(
-            exclude=mutable_policy_fields
-        ):
-            raise ToolActionError(
-                f"tool schema changed during runtime refresh: {manifest.tool_id}"
-            )
-        self.catalog.replace(manifest)
-        if manifest.enabled:
-            self._runtimes[manifest.tool_id] = runtime
-        else:
-            self._runtimes.pop(manifest.tool_id, None)
+        Existing actions are bound to the prior manifest fingerprint and will
+        refuse execution after any policy replacement. They must be recreated.
+        """
+
+        with self._registry_lock:
+            existing = self.catalog.get(manifest.tool_id)
+            mutable_policy_fields = {
+                "risk_level",
+                "side_effect_class",
+                "required_approval",
+                "idempotency_policy",
+                "undo_strategy",
+                "enabled",
+                "degraded_reason",
+            }
+            if existing.model_dump(exclude=mutable_policy_fields) != manifest.model_dump(
+                exclude=mutable_policy_fields
+            ):
+                raise ToolActionError(
+                    f"tool schema changed during runtime refresh: {manifest.tool_id}"
+                )
+            self.catalog.replace(manifest)
+            if manifest.enabled:
+                self._runtimes[manifest.tool_id] = runtime
+            else:
+                self._runtimes.pop(manifest.tool_id, None)
 
     def unregister_runtime(self, tool_id: str) -> None:
         """Remove an external runtime binding while retaining its audit manifest."""
 
-        self._runtimes.pop(tool_id, None)
+        with self._registry_lock:
+            self._runtimes.pop(tool_id, None)
 
     def begin_task(self, task_id: str) -> None:
         """Clear a prior Stop marker when the owner explicitly starts/resumes work."""
@@ -202,17 +212,31 @@ class ToolActionService:
         if existing is not None:
             return existing
         try:
-            manifest = self.catalog.get(stored.tool_id)
+            with self._registry_lock:
+                manifest = self.catalog.get(stored.tool_id)
+                fingerprint = self._manifest_fingerprint(manifest)
         except ManifestValidationError as exc:
             raise ToolActionError(str(exc)) from exc
         context = self._context_factory(stored)
-        action = self.store.put_action(
+        task_risk = None
+        if self._tasks is not None:
+            task = self._tasks.get(stored.task_id)
+            if task is not None:
+                task_risk = task.risk_level
+        action, created = self.store.put_action_once(
             ToolAction.from_proposal(
                 stored,
                 manifest_version=manifest.version,
-                effective_risk=self._effective_risk(manifest, context),
+                manifest_fingerprint=fingerprint,
+                effective_risk=self._effective_risk(
+                    manifest,
+                    context,
+                    task_risk=task_risk,
+                ),
             )
         )
+        if not created:
+            return action
         self._emit(action, "tool.proposed", {"target": stored.target})
 
         validation_error = self._validate_proposal(stored, manifest, context)
@@ -238,45 +262,64 @@ class ToolActionService:
         self._emit(action, "tool.validated", self._decision_payload(decision))
         return action
 
-    async def execute(
-        self,
-        action_id: str,
-    ) -> ToolAction:
-        """Execute one validated action in its manifest-owned resource lane."""
+    async def execute(self, action_id: str) -> ToolAction:
+        """Execute one validated action exactly once."""
 
+        return await self._execute(action_id, allow_failed=False)
+
+    async def _execute(self, action_id: str, *, allow_failed: bool) -> ToolAction:
         lock = self._locks.setdefault(action_id, asyncio.Lock())
         async with lock:
             action = self._require_action(action_id)
             if action.status is ActionStatus.COMPLETED:
                 return action
-            if self._task_interrupted(action.task_id):
-                raise ToolActionError("tool chain was stopped by the owner")
-            proposal = self._require_proposal(action.proposal_id)
-            manifest = self.catalog.get(action.tool_id)
-            context = self._context_factory(proposal)
-            if action.status is ActionStatus.WAITING_APPROVAL:
-                if not self._flow_authority.is_flow():
-                    raise ToolActionError("action is unavailable outside Flow mode")
-            elif action.status not in {ActionStatus.VALIDATED, ActionStatus.FAILED}:
+            if action.status is ActionStatus.RECOVERY_REQUIRED:
+                raise ToolActionError(
+                    "action requires recovery because the prior effect is unknown"
+                )
+            if action.status is ActionStatus.FAILED and not allow_failed:
+                raise ToolActionError("failed actions may only run through retry()")
+            if action.status not in {
+                ActionStatus.VALIDATED,
+                ActionStatus.FAILED,
+            }:
                 raise ToolActionError(
                     f"action cannot execute from {action.status.value}"
                 )
-            decision = self._flow_authority.authorize_tool(
+            if self._task_interrupted(action.task_id):
+                raise ToolActionError("tool chain was stopped by the owner")
+
+            proposal = self._require_proposal(action.proposal_id)
+            with self._registry_lock:
+                manifest = self.catalog.get(action.tool_id)
+                runtime = self._runtimes.get(action.tool_id)
+                manifest_fingerprint = self._manifest_fingerprint(manifest)
+            binding_error = self._validate_execution_binding(
+                action,
+                proposal,
                 manifest,
-                ToolPolicyContext(
-                    granted_capabilities=context.granted_capabilities,
-                    execution_lane=context.execution_lane,
-                    requested_risk=context.requested_risk,
-                    proposal_capability=context.proposal_capability,
-                    untrusted_risk=context.untrusted_risk,
-                    allowed_roots=context.allowed_roots,
-                ),
+                manifest_fingerprint,
             )
+            if binding_error:
+                raise ToolActionError(binding_error)
+            if runtime is None:
+                raise ToolActionError("registered tool has no runtime")
+
+            context = self._context_factory(proposal)
+            bounded_context = self._bind_risk_floor(action, context)
+            decision = self._flow_authority.authorize_tool(manifest, bounded_context)
             if not decision.allowed:
                 raise ToolActionError(decision.reason)
             return await self._lanes.run(
-                context.execution_lane,
-                lambda: self._execute_in_lane(action, proposal, manifest),
+                bounded_context.execution_lane,
+                lambda: self._execute_in_lane(
+                    action,
+                    proposal,
+                    manifest,
+                    manifest_fingerprint,
+                    runtime,
+                    allow_failed=allow_failed,
+                ),
             )
 
     def cancel(self, action_id: str) -> ToolAction:
@@ -285,47 +328,104 @@ class ToolActionService:
             return action
         if action.status in {ActionStatus.COMPLETED, ActionStatus.DENIED}:
             raise ToolActionError(f"terminal action is already {action.status.value}")
-        action = self.store.transition(action.action_id, ActionStatus.CANCELED)
-        self._emit(action, "tool.canceled", {})
+        effect_known = action.status not in {
+            ActionStatus.RUNNING,
+            ActionStatus.VERIFYING,
+            ActionStatus.RECOVERY_REQUIRED,
+        }
+        action = self.store.transition(
+            action.action_id,
+            ActionStatus.CANCELED,
+            effect_known=effect_known,
+            verification_status=(
+                VerificationStatus.UNKNOWN if not effect_known else None
+            ),
+            error=("action canceled while effect was in flight" if not effect_known else None),
+        )
+        with self._interrupt_lock:
+            active = self._active_runtimes.get(action_id)
+        if active is not None and active[1].interrupt is not None:
+            try:
+                active[1].interrupt()
+            except Exception:
+                pass
+        self._emit(action, "tool.canceled", {"effect_known": effect_known})
         return action
+
+    def recover(self, action_id: str) -> ToolAction:
+        """Persist a post-crash unknown-effect state without re-running the handler."""
+
+        action = self._require_action(action_id)
+        if action.status is ActionStatus.RECOVERY_REQUIRED:
+            return action
+        with self._interrupt_lock:
+            if action_id in self._active_runtimes:
+                raise ToolActionError("cannot recover an action that is active locally")
+        if action.status not in {ActionStatus.RUNNING, ActionStatus.VERIFYING}:
+            return action
+        recovered = self.store.mark_recovery_required(
+            action.action_id,
+            error="process ended before effect and verification could be reconciled",
+        )
+        self._emit(
+            recovered,
+            "tool.recovery_required",
+            {"reason": "incomplete_persisted_execution", "effect_known": False},
+        )
+        return recovered
 
     async def retry(self, action_id: str) -> ToolAction:
         action = self._require_action(action_id)
         if action.status is not ActionStatus.FAILED:
             raise ToolActionError("only a failed action can be retried")
         manifest = self.catalog.get(action.tool_id)
+        if action.manifest_fingerprint != self._manifest_fingerprint(manifest):
+            raise ToolActionError("tool policy changed; recreate the action before retry")
         if action.retry_count >= manifest.max_retries:
             raise ToolActionError("maximum retries reached")
         if not action.effect_known:
             raise ToolActionError("retry blocked because the prior effect is unknown")
-        if manifest.idempotency_policy is IdempotencyPolicy.NEVER_AFTER_UNKNOWN_EFFECT:
+        if manifest.idempotency_policy is not IdempotencyPolicy.SAFE_RETRY:
             raise ToolActionError("manifest does not permit automatic retry")
         self.store.transition(
             action.action_id,
             ActionStatus.FAILED,
             retry_count=action.retry_count + 1,
         )
-        return await self.execute(action.action_id)
+        return await self._execute(action.action_id, allow_failed=True)
 
     async def _execute_in_lane(
         self,
         action: ToolAction,
         proposal: ToolProposal,
         manifest: ToolManifest,
+        manifest_fingerprint: str,
+        runtime: RegisteredToolRuntime,
+        *,
+        allow_failed: bool,
     ) -> ToolAction:
-        runtime = self._runtimes.get(action.tool_id)
-        if runtime is None:
-            return self._fail(
-                action,
-                "registered tool has no runtime",
-                effect_known=True,
+        # Re-check the exact policy/runtime snapshot after waiting for the lane.
+        with self._registry_lock:
+            current_manifest = self.catalog.get(action.tool_id)
+            current_runtime = self._runtimes.get(action.tool_id)
+            if self._manifest_fingerprint(current_manifest) != manifest_fingerprint:
+                raise ToolActionError("tool policy changed before execution")
+            if current_runtime is not runtime:
+                raise ToolActionError("tool runtime changed before execution")
+
+        run_id = f"run_{uuid.uuid4().hex}"
+        action, claimed = self.store.claim_execution(
+            action.action_id,
+            tool_run_id=run_id,
+            allow_failed=allow_failed,
+        )
+        if not claimed:
+            if action.status in {ActionStatus.COMPLETED, ActionStatus.CANCELED}:
+                return action
+            raise ToolActionError(
+                f"action execution is already claimed or blocked: {action.status.value}"
             )
-        if action.status is not ActionStatus.RUNNING:
-            action = self.store.transition(
-                action.action_id,
-                ActionStatus.RUNNING,
-                tool_run_id=f"run_{uuid.uuid4().hex}",
-            )
+
         self._emit(action, "tool.started", {"timeout": manifest.timeout})
         with self._interrupt_lock:
             self._active_runtimes[action.action_id] = (action.task_id, runtime)
@@ -336,28 +436,46 @@ class ToolActionService:
             )
         except TimeoutError:
             if runtime.interrupt is not None:
-                await asyncio.to_thread(runtime.interrupt)
-            return self._fail(action, "tool execution timed out", effect_known=False)
-        except Exception as exc:
-            return self._fail(
+                try:
+                    await asyncio.to_thread(runtime.interrupt)
+                except Exception:
+                    pass
+            return self._ambiguous_or_failed(
                 action,
+                manifest,
+                "tool execution timed out",
+            )
+        except Exception as exc:
+            return self._ambiguous_or_failed(
+                action,
+                manifest,
                 f"tool execution failed: {type(exc).__name__}",
-                effect_known=manifest.side_effect_class
-                in {SideEffectClass.NONE, SideEffectClass.LOCAL_READ},
             )
         finally:
             with self._interrupt_lock:
                 self._active_runtimes.pop(action.action_id, None)
 
+        current = self._require_action(action.action_id)
+        if current.status in {ActionStatus.CANCELED, ActionStatus.RECOVERY_REQUIRED}:
+            return current
         if self._task_interrupted(action.task_id):
-            action = self.store.transition(
-                action.action_id,
-                ActionStatus.CANCELED,
-                error="tool chain stopped by owner",
-                effect_known=False,
-            )
+            try:
+                action = self.store.transition(
+                    action.action_id,
+                    ActionStatus.CANCELED,
+                    error="tool chain stopped by owner",
+                    effect_known=False,
+                    verification_status=VerificationStatus.UNKNOWN,
+                )
+            except ActionStoreError:
+                return self._require_action(action.action_id)
             self._emit(action, "tool.canceled", {"reason": "owner_stop"})
             return action
+        if current.status is not ActionStatus.RUNNING:
+            raise ToolActionError(
+                f"action left running state unexpectedly: {current.status.value}"
+            )
+        action = current
 
         output_payload = redact_data(output)
         output_summary, artifact = self._store_output(action, output_payload)
@@ -370,11 +488,17 @@ class ToolActionService:
             },
             artifact_id=artifact.artifact_id if artifact else None,
         )
-        action = self.store.transition(
-            action.action_id,
-            ActionStatus.VERIFYING,
-            output_summary=output_summary,
-        )
+        try:
+            action = self.store.transition(
+                action.action_id,
+                ActionStatus.VERIFYING,
+                output_summary=output_summary,
+            )
+        except ActionStoreError:
+            current = self._require_action(action.action_id)
+            if current.status in {ActionStatus.CANCELED, ActionStatus.RECOVERY_REQUIRED}:
+                return current
+            raise
         self._emit(action, "tool.verification_started", {})
         try:
             verification = await asyncio.to_thread(
@@ -383,16 +507,16 @@ class ToolActionService:
                 output,
             )
         except Exception as exc:
-            return self._fail(
+            return self._ambiguous_or_failed(
                 action,
+                manifest,
                 f"verification failed: {type(exc).__name__}",
-                effect_known=False,
             )
         if not isinstance(verification, VerificationResult):
-            return self._fail(
+            return self._ambiguous_or_failed(
                 action,
+                manifest,
                 "verifier returned an invalid result",
-                effect_known=False,
             )
         if not verification.passed:
             self._emit(
@@ -403,16 +527,32 @@ class ToolActionService:
                     "expected": verification.expected_state,
                 },
             )
+            if self._effect_can_be_external(manifest):
+                return self._recovery_required(
+                    action,
+                    "postcondition failed after a potentially partial effect",
+                )
             return self._fail(
                 action,
                 "postcondition was not verified",
                 effect_known=True,
             )
-        action = self.store.transition(
-            action.action_id,
-            ActionStatus.VERIFIED,
-            verification_status=VerificationStatus.PASSED,
-        )
+
+        current = self._require_action(action.action_id)
+        if current.status is ActionStatus.CANCELED:
+            return current
+        try:
+            action = self.store.transition(
+                action.action_id,
+                ActionStatus.VERIFIED,
+                verification_status=VerificationStatus.PASSED,
+                effect_known=True,
+            )
+        except ActionStoreError:
+            current = self._require_action(action.action_id)
+            if current.status is ActionStatus.CANCELED:
+                return current
+            raise
         self._emit(
             action,
             "tool.verified",
@@ -422,7 +562,13 @@ class ToolActionService:
                 "artifact_ids": list(verification.artifact_ids),
             },
         )
-        action = self.store.transition(action.action_id, ActionStatus.COMPLETED)
+        try:
+            action = self.store.transition(action.action_id, ActionStatus.COMPLETED)
+        except ActionStoreError:
+            current = self._require_action(action.action_id)
+            if current.status is ActionStatus.CANCELED:
+                return current
+            raise
         self._emit(action, "tool.completed", {})
         return action
 
@@ -454,6 +600,55 @@ class ToolActionService:
         if context.proposal_capability != proposal.capability:
             return "trusted context does not match proposal capability"
         return ""
+
+    def _validate_execution_binding(
+        self,
+        action: ToolAction,
+        proposal: ToolProposal,
+        manifest: ToolManifest,
+        manifest_fingerprint: str,
+    ) -> str:
+        if not action.manifest_fingerprint:
+            return "legacy action has no policy fingerprint; recreate it before execution"
+        if action.manifest_fingerprint != manifest_fingerprint:
+            return "trusted manifest changed after proposal; recreate the action"
+        if action.manifest_version != manifest.version:
+            return "trusted manifest version changed after proposal"
+        if action.tool_id != proposal.tool_id or action.tool_id != manifest.tool_id:
+            return "action tool identity differs from its proposal or manifest"
+        if action.capability != proposal.capability or action.capability != manifest.capability:
+            return "action capability differs from its proposal or manifest"
+        if (
+            action.expected_side_effect is not proposal.expected_side_effect
+            or action.expected_side_effect is not manifest.side_effect_class
+        ):
+            return "action side effect differs from its proposal or manifest"
+        if action.idempotency_key != proposal.idempotency_key:
+            return "action idempotency key differs from its proposal"
+        return ""
+
+    @staticmethod
+    def _bind_risk_floor(
+        action: ToolAction,
+        context: ToolPolicyContext,
+    ) -> ToolPolicyContext:
+        risk_type = type(action.risk_level)
+        floor = risk_type(
+            max(
+                int(action.risk_level),
+                int(context.requested_risk),
+                int(context.untrusted_risk),
+            )
+        )
+        return ToolPolicyContext(
+            granted_capabilities=context.granted_capabilities,
+            execution_lane=context.execution_lane,
+            requested_risk=floor,
+            proposal_capability=context.proposal_capability,
+            approved_once=context.approved_once,
+            untrusted_risk=floor,
+            allowed_roots=context.allowed_roots,
+        )
 
     def _store_output(
         self,
@@ -505,6 +700,40 @@ class ToolActionService:
             )
         return f"output stored as artifact ({len(encoded)} bytes)", artifact
 
+    @staticmethod
+    def _effect_can_be_external(manifest: ToolManifest) -> bool:
+        return manifest.side_effect_class not in {
+            SideEffectClass.NONE,
+            SideEffectClass.LOCAL_READ,
+        }
+
+    def _ambiguous_or_failed(
+        self,
+        action: ToolAction,
+        manifest: ToolManifest,
+        error: str,
+    ) -> ToolAction:
+        if self._effect_can_be_external(manifest):
+            return self._recovery_required(action, error)
+        return self._fail(action, error, effect_known=True)
+
+    def _recovery_required(self, action: ToolAction, error: str) -> ToolAction:
+        current = self._require_action(action.action_id)
+        if current.status is ActionStatus.CANCELED:
+            return current
+        if current.status is ActionStatus.RECOVERY_REQUIRED:
+            return current
+        recovered = self.store.mark_recovery_required(
+            action.action_id,
+            error=error,
+        )
+        self._emit(
+            recovered,
+            "tool.recovery_required",
+            {"error": error, "effect_known": False},
+        )
+        return recovered
+
     def _fail(
         self,
         action: ToolAction,
@@ -512,6 +741,9 @@ class ToolActionService:
         *,
         effect_known: bool,
     ) -> ToolAction:
+        current = self._require_action(action.action_id)
+        if current.status is ActionStatus.CANCELED:
+            return current
         action = self.store.transition(
             action.action_id,
             ActionStatus.FAILED,
@@ -572,17 +804,29 @@ class ToolActionService:
         return event
 
     @staticmethod
+    def _manifest_fingerprint(manifest: ToolManifest) -> str:
+        canonical = json.dumps(
+            manifest.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    @staticmethod
     def _effective_risk(
         manifest: ToolManifest,
         context: ToolPolicyContext,
+        *,
+        task_risk: int | None = None,
     ):
-        return type(manifest.risk_level)(
-            max(
-                int(manifest.risk_level),
-                int(context.requested_risk),
-                int(context.untrusted_risk),
-            )
-        )
+        values = [
+            int(manifest.risk_level),
+            int(context.requested_risk),
+            int(context.untrusted_risk),
+        ]
+        if task_risk is not None:
+            values.append(int(task_risk))
+        return type(manifest.risk_level)(max(values))
 
     @staticmethod
     def _decision_payload(decision: ToolPolicyDecision) -> dict[str, Any]:
