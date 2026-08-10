@@ -56,12 +56,13 @@ class FakeManager:
 
 class FakeAdapter:
     def __init__(self, result):
-        self.result = result
+        self.results = list(result) if isinstance(result, list) else [result]
         self.calls = 0
 
     def reconnect(self, _session):
+        index = min(self.calls, len(self.results) - 1)
         self.calls += 1
-        return self.result
+        return self.results[index]
 
 
 def _session() -> BrowserSession:
@@ -132,10 +133,11 @@ def test_reconnect_failure_is_honest_and_bounded() -> None:
 def test_control_service_restart_can_recover() -> None:
     unhealthy = _health(connection_ok=False, cause="connection_lost")
     manager = FakeManager([unhealthy, unhealthy, _health()], restart=True)
-    adapter = FakeAdapter(False)
+    adapter = FakeAdapter([False, True])
     record = BrowserRecoveryController(manager, adapter).recover(_session())
     assert record.result == "control_service_restarted"
     assert record.control_restart_attempted is True
+    assert adapter.calls == 2
     assert manager.restart_calls == 1
 
 
