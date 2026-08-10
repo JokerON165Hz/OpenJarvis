@@ -13,6 +13,7 @@ from openjarvis.browser import (
     BrowserOpenError,
     BrowserProcessManager,
     BrowserProfilePolicy,
+    BrowserSession,
 )
 
 
@@ -100,3 +101,24 @@ def test_port_conflict_with_foreign_process_never_kills_foreign(tmp_path: Path) 
     finally:
         manager.close(session)
         foreign.close()
+
+
+def test_cleanup_rejects_untracked_session_and_leaves_profile_untouched(
+    tmp_path: Path,
+) -> None:
+    policy = BrowserProfilePolicy(tmp_path / "profiles")
+    manager = BrowserProcessManager(
+        executable=sys.executable,
+        profile_policy=policy,
+        command_builder=lambda profile, port, visible: [sys.executable],
+    )
+    foreign_profile = tmp_path / "foreign-browser-profile"
+    foreign_profile.mkdir()
+    marker = foreign_profile / "keep.txt"
+    marker.write_text("foreign", encoding="utf-8")
+    foreign = BrowserSession(profile_path=foreign_profile, control_port=9222)
+
+    with pytest.raises(BrowserOpenError, match="not owned"):
+        manager.close(foreign)
+
+    assert marker.read_text(encoding="utf-8") == "foreign"

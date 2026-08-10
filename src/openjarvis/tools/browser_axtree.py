@@ -80,12 +80,25 @@ class BrowserAXTreeTool(BaseTool):
                 )
 
             text = _format_axtree(snapshot, max_depth=max_depth)
+            if _session.page is not page:  # type: ignore[union-attr]
+                raise RuntimeError("active browser tab changed during AX extraction")
+            tab_id = getattr(_session, "current_tab_id", "")
+            if not isinstance(tab_id, str):
+                tab_id = f"page:{id(page):x}"
+            page_url = getattr(page, "url", "")
+            if not isinstance(page_url, str):
+                page_url = ""
 
             return ToolResult(
                 tool_name="browser_axtree",
                 content=text,
                 success=True,
-                metadata={"node_count": _count_nodes(snapshot)},
+                metadata={
+                    "node_count": _count_nodes(snapshot),
+                    "tab_id": tab_id,
+                    "final_url": page_url,
+                    "content_trust": "untrusted",
+                },
             )
         except Exception as exc:
             return ToolResult(

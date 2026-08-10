@@ -15,8 +15,12 @@ from openjarvis.browser.actions import (
 )
 from openjarvis.browser.cdp import (
     BrowserControlError,
+    BrowserErrorCode,
+    BrowserExtraction,
     BrowserObservation,
+    BrowserTab,
     CdpBrowserAdapter,
+    normalize_url,
 )
 from openjarvis.browser.models import (
     BrowserControlHealth,
@@ -39,6 +43,8 @@ __all__ = [
     "BrowserArtifactStore",
     "BrowserControlHealth",
     "BrowserControlError",
+    "BrowserErrorCode",
+    "BrowserExtraction",
     "BrowserNetworkPolicy",
     "BrowserObservation",
     "BrowserOpenError",
@@ -51,9 +57,11 @@ __all__ = [
     "BrowserSession",
     "BrowserSessionStatus",
     "BrowserSessionService",
+    "BrowserTab",
     "BrowserToolAdapter",
     "BrowserTransferPolicy",
     "CdpBrowserAdapter",
     "InjectionAssessment",
+    "normalize_url",
     "WebInjectionGuard",
 ]
