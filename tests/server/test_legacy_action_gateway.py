@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from openjarvis.flow.authority import FlowSessionAuthority
 from openjarvis.server.agent_manager_routes import (
     _execute_exposed_tool_via_action_service,
 )
@@ -25,7 +26,10 @@ from openjarvis.tools.manifest import (
 )
 
 
-def _service(tmp_path: Path, calls: list[str]) -> tuple[ToolActionService, TaskStore]:
+def _service(
+    tmp_path: Path,
+    calls: list[str],
+) -> tuple[ToolActionService, TaskStore, FlowSessionAuthority]:
     manifest = ToolManifest(
         tool_id="test.observe",
         name="test.observe",
@@ -65,6 +69,8 @@ def _service(tmp_path: Path, calls: list[str]) -> tuple[ToolActionService, TaskS
         calls.append(arguments["value"])
         return {"value": arguments["value"]}
 
+    authority = FlowSessionAuthority()
+    authority.activate_assistant()
     service = ToolActionService(
         catalog=ToolManifestCatalog((manifest,)),
         store=ActionStore(tmp_path / "actions.db"),
@@ -81,8 +87,9 @@ def _service(tmp_path: Path, calls: list[str]) -> tuple[ToolActionService, TaskS
         },
         artifact_root=tmp_path / "artifacts",
         task_service=tasks,
+        flow_authority=authority,
     )
-    return service, task_store
+    return service, task_store, authority
 
 
 @pytest.mark.asyncio
@@ -90,10 +97,11 @@ async def test_managed_tool_routes_through_policy_verification_and_idempotency(
     tmp_path: Path,
 ) -> None:
     calls: list[str] = []
-    service, task_store = _service(tmp_path, calls)
+    service, task_store, authority = _service(tmp_path, calls)
     state = SimpleNamespace(
         tool_action_service=service,
         task_service=service._tasks,
+        flow_authority=authority,
     )
     kwargs = {
         "app_state": state,
