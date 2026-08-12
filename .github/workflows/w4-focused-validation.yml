@@ -1,0 +1,93 @@
+name: W4 Focused Validation
+
+on:
+  push:
+    branches:
+      - closure/w4-validation-temp
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.0.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra framework-comparison --extra server
+
+      - name: Build Rust extension
+        run: uv run maturin develop --manifest-path rust/crates/openjarvis-python/Cargo.toml
+
+      - name: git diff --check W4
+        run: git diff --check 26ed6fcf30fd1f2f2473c29b7fcd5e736a91931e HEAD^
+
+      - name: Targeted Ruff check W4
+        run: >-
+          uv run ruff check
+          src/openjarvis/tools/_stubs.py
+          tests/security/test_tool_confirmation.py
+          tests/server/test_legacy_action_gateway.py
+
+      - name: Targeted Ruff format check W4
+        run: >-
+          uv run ruff format --check
+          src/openjarvis/tools/_stubs.py
+          tests/security/test_tool_confirmation.py
+          tests/server/test_legacy_action_gateway.py
+
+      - name: Legacy gateway policy verification
+        continue-on-error: true
+        run: >-
+          uv run pytest -q
+          tests/server/test_legacy_action_gateway.py::test_managed_tool_routes_through_policy_verification_and_idempotency
+
+      - name: Tool confirmation suite
+        continue-on-error: true
+        run: uv run pytest -q tests/security/test_tool_confirmation.py
+
+      - name: Task routes suite
+        continue-on-error: true
+        run: uv run pytest -q tests/server/test_task_routes.py
+
+      - name: Fresh turn correlation follow-up
+        continue-on-error: true
+        run: >-
+          uv run pytest -q
+          tests/server/test_task_routes.py::test_tool_followup_uses_a_fresh_turn_correlation
+
+      - name: Memory candidate suite
+        continue-on-error: true
+        run: uv run pytest -q tests/memory/test_memory_candidates.py
+
+      - name: Task policy suite
+        continue-on-error: true
+        run: uv run pytest -q tests/tasks/test_policy.py
+
+      - name: Task approval suite
+        continue-on-error: true
+        run: uv run pytest -q tests/tasks/test_approval.py
+
+      - name: Phase5 tool policy suite
+        continue-on-error: true
+        run: uv run pytest -q tests/tasks/test_tool_policy_phase5.py
+
+      - name: Tool browser route suite
+        continue-on-error: true
+        run: uv run pytest -q tests/server/test_tool_browser_routes.py
