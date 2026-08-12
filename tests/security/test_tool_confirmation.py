@@ -115,11 +115,12 @@ class TestToolConfirmation:
         call = ToolCall(id="1", name="safe", arguments="{}")
         result = executor.execute(call)
         assert result.success is True
+        assert result.content == "safe result"
         # Callback should NOT have been called
         assert len(calls) == 0
 
     def test_confirmation_callback_receives_message(self) -> None:
-        """Confirm callback receives a descriptive message."""
+        """Confirm callback receives proposed args before strict validation."""
         received = []
 
         def capture(msg: str) -> bool:
@@ -132,8 +133,10 @@ class TestToolConfirmation:
             confirm_callback=capture,
         )
         call = ToolCall(id="1", name="dangerous", arguments='{"action": "delete"}')
-        executor.execute(call)
+        result = executor.execute(call)
 
         assert len(received) == 1
         assert "dangerous" in received[0]
         assert "action" in received[0]
+        assert result.success is False
+        assert "Manifest validation failed" in result.content
