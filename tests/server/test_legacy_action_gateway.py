@@ -119,9 +119,7 @@ async def test_managed_tool_routes_through_policy_verification_and_idempotency(
     task_id = state.task_service.list()[0].task_id
     action = service.store.list_actions(task_id)[0]
     assert action.verification_status.value == "passed"
-    event_names = [
-        event.event_type for event in service.store.list_events(action.action_id)
-    ]
+    event_names = [event.event_type for event in service.store.list_events(action.action_id)]
     assert event_names[-3:] == [
         "tool.verification_started",
         "tool.verified",

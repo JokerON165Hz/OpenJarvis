@@ -206,11 +206,7 @@ class ToolExecutor:
                         )
                     return ToolResult(
                         tool_name=tool_call.name,
-                        content=(
-                            f"Capability '{cap}' denied for"
-                            f" agent '{self._agent_id}'"
-                            f" on tool '{tool_call.name}'."
-                        ),
+                        content=(f"Capability '{cap}' denied for agent '{self._agent_id}' on tool '{tool_call.name}'."),
                         success=False,
                     )
 
@@ -246,9 +242,7 @@ class ToolExecutor:
                 return ToolResult(
                     tool_name=tool_call.name,
                     content=(
-                        f"Tool '{tool_call.name}' requires"
-                        " confirmation but no confirmation"
-                        " callback is available."
+                        f"Tool '{tool_call.name}' requires confirmation but no confirmation callback is available."
                     ),
                     success=False,
                 )
