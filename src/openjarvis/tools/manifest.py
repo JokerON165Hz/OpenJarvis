@@ -127,6 +127,12 @@ class ToolManifest(BaseModel):
             raise ValueError("at least one allowed lane is required")
         if not self.supported_platforms:
             raise ValueError("at least one supported platform is required")
+        if (
+            self.enabled
+            and int(self.risk_level)
+            == int(RiskLevel.FINANCIAL_OR_SECURITY_CRITICAL)
+        ):
+            raise ValueError("level-4 tools must be disabled")
         if not self.enabled and not self.degraded_reason:
             raise ValueError("disabled tools require degraded_reason")
         return self
@@ -292,7 +298,7 @@ def manifest_from_spec(tool_id: str, spec: Any) -> ToolManifest:
         if browser or capability == "network:fetch"
         else NetworkPolicy.DENY
     )
-    retryable = risk is RiskLevel.READ_ONLY
+    retryable = risk == RiskLevel.READ_ONLY
     enabled = True
     return ToolManifest(
         tool_id=str(tool_id),
@@ -328,9 +334,9 @@ def manifest_from_spec(tool_id: str, spec: Any) -> ToolManifest:
         ),
         undo_strategy=(
             "restore_artifact_required"
-            if side_effect is SideEffectClass.REVERSIBLE_LOCAL_WRITE
+            if side_effect == SideEffectClass.REVERSIBLE_LOCAL_WRITE
             else "not_applicable"
-            if risk is RiskLevel.READ_ONLY
+            if risk == RiskLevel.READ_ONLY
             else "manual_or_tool_specific"
         ),
         # Retained in the serialized compatibility schema only.  FlowSessionAuthority,
