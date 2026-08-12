@@ -338,13 +338,13 @@ class ToolActionService:
         lock = self._locks.setdefault(action_id, asyncio.Lock())
         async with lock:
             action = self._require_action(action_id)
-            if action.status is ActionStatus.COMPLETED:
+            if action.status == ActionStatus.COMPLETED:
                 return action
-            if action.status is ActionStatus.RECOVERY_REQUIRED:
+            if action.status == ActionStatus.RECOVERY_REQUIRED:
                 raise ToolActionError(
                     "action requires recovery because the prior effect is unknown"
                 )
-            if action.status is ActionStatus.FAILED and not allow_failed:
+            if action.status == ActionStatus.FAILED and not allow_failed:
                 raise ToolActionError("failed actions may only run through retry()")
             if action.status not in {
                 ActionStatus.VALIDATED,
@@ -396,7 +396,7 @@ class ToolActionService:
 
     def cancel(self, action_id: str) -> ToolAction:
         action = self._require_action(action_id)
-        if action.status is ActionStatus.CANCELED:
+        if action.status == ActionStatus.CANCELED:
             return action
         if action.status in {ActionStatus.COMPLETED, ActionStatus.DENIED}:
             raise ToolActionError(f"terminal action is already {action.status.value}")
@@ -428,7 +428,7 @@ class ToolActionService:
         """Persist a post-crash unknown-effect state without re-running the handler."""
 
         action = self._require_action(action_id)
-        if action.status is ActionStatus.RECOVERY_REQUIRED:
+        if action.status == ActionStatus.RECOVERY_REQUIRED:
             return action
         with self._interrupt_lock:
             if action_id in self._active_runtimes:
@@ -448,7 +448,7 @@ class ToolActionService:
 
     async def retry(self, action_id: str, *, action_lease=None) -> ToolAction:
         action = self._require_action(action_id)
-        if action.status is not ActionStatus.FAILED:
+        if action.status != ActionStatus.FAILED:
             raise ToolActionError("only a failed action can be retried")
         manifest = self.catalog.get(action.tool_id)
         if action.manifest_fingerprint != self._manifest_fingerprint(manifest):
@@ -457,7 +457,7 @@ class ToolActionService:
             raise ToolActionError("maximum retries reached")
         if not action.effect_known:
             raise ToolActionError("retry blocked because the prior effect is unknown")
-        if manifest.idempotency_policy is not IdempotencyPolicy.SAFE_RETRY:
+        if manifest.idempotency_policy != IdempotencyPolicy.SAFE_RETRY:
             raise ToolActionError("manifest does not permit automatic retry")
         self.store.transition(
             action.action_id,
@@ -547,7 +547,7 @@ class ToolActionService:
                 return self._require_action(action.action_id)
             self._emit(action, "tool.canceled", {"reason": "owner_stop"})
             return action
-        if current.status is not ActionStatus.RUNNING:
+        if current.status != ActionStatus.RUNNING:
             raise ToolActionError(
                 f"action left running state unexpectedly: {current.status.value}"
             )
@@ -615,7 +615,7 @@ class ToolActionService:
             )
 
         current = self._require_action(action.action_id)
-        if current.status is ActionStatus.CANCELED:
+        if current.status == ActionStatus.CANCELED:
             return current
         try:
             action = self.store.transition(
@@ -626,7 +626,7 @@ class ToolActionService:
             )
         except ActionStoreError:
             current = self._require_action(action.action_id)
-            if current.status is ActionStatus.CANCELED:
+            if current.status == ActionStatus.CANCELED:
                 return current
             raise
         self._emit(
@@ -642,7 +642,7 @@ class ToolActionService:
             action = self.store.transition(action.action_id, ActionStatus.COMPLETED)
         except ActionStoreError:
             current = self._require_action(action.action_id)
-            if current.status is ActionStatus.CANCELED:
+            if current.status == ActionStatus.CANCELED:
                 return current
             raise
         self._emit(action, "tool.completed", {})
@@ -660,7 +660,7 @@ class ToolActionService:
             return str(exc)
         if proposal.capability != manifest.capability:
             return "proposal capability differs from trusted manifest"
-        if proposal.expected_side_effect is not manifest.side_effect_class:
+        if proposal.expected_side_effect != manifest.side_effect_class:
             return "proposal side effect differs from trusted manifest"
         if proposal.timeout_seconds > manifest.timeout:
             return "proposal timeout exceeds trusted manifest"
@@ -695,8 +695,8 @@ class ToolActionService:
         if action.capability != proposal.capability or action.capability != manifest.capability:
             return "action capability differs from its proposal or manifest"
         if (
-            action.expected_side_effect is not proposal.expected_side_effect
-            or action.expected_side_effect is not manifest.side_effect_class
+            action.expected_side_effect != proposal.expected_side_effect
+            or action.expected_side_effect != manifest.side_effect_class
         ):
             return "action side effect differs from its proposal or manifest"
         if action.idempotency_key != proposal.idempotency_key:
@@ -816,9 +816,9 @@ class ToolActionService:
 
     def _recovery_required(self, action: ToolAction, error: str) -> ToolAction:
         current = self._require_action(action.action_id)
-        if current.status is ActionStatus.CANCELED:
+        if current.status == ActionStatus.CANCELED:
             return current
-        if current.status is ActionStatus.RECOVERY_REQUIRED:
+        if current.status == ActionStatus.RECOVERY_REQUIRED:
             return current
         recovered = self.store.mark_recovery_required(
             action.action_id,
@@ -839,7 +839,7 @@ class ToolActionService:
         effect_known: bool,
     ) -> ToolAction:
         current = self._require_action(action.action_id)
-        if current.status is ActionStatus.CANCELED:
+        if current.status == ActionStatus.CANCELED:
             return current
         action = self.store.transition(
             action.action_id,
