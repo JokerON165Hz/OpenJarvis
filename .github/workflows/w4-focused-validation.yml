@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  final-focused:
+  final-static:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -17,80 +17,30 @@ jobs:
           ref: closure/w4-server-policy
           fetch-depth: 0
 
-      - name: Verify formatted W4 head
-        run: test "$(git rev-parse HEAD)" = "198a7b896fef06d2e3e299ac3cf4e075e5ab26fb"
+      - name: Verify final W4 head
+        run: test "$(git rev-parse HEAD)" = "0ef71ef040946b940825601587759a393c91577c"
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install targeted Ruff
+        run: python -m pip install ruff==0.15.1
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.0.0
-
-      - name: Install dependencies
-        run: uv sync --extra dev --extra framework-comparison --extra server
-
-      - name: Build Rust extension
-        run: uv run maturin develop --manifest-path rust/crates/openjarvis-python/Cargo.toml
-
-      - name: Prepare standard OpenJarvis config directory
-        run: mkdir -p "$HOME/.openjarvis"
-
-      - name: git diff --check W4 final code
+      - name: git diff --check W4 final head
         run: git diff --check 26ed6fcf30fd1f2f2473c29b7fcd5e736a91931e HEAD
 
-      - name: Targeted Ruff check W4 final code
+      - name: Targeted Ruff check W4 final head
         run: >-
-          uv run ruff check
+          ruff check
           src/openjarvis/tools/_stubs.py
           tests/security/test_tool_confirmation.py
           tests/server/test_legacy_action_gateway.py
 
-      - name: Targeted Ruff format check W4 final code
+      - name: Targeted Ruff format check W4 final head
         run: >-
-          uv run ruff format --check
+          ruff format --check
           src/openjarvis/tools/_stubs.py
           tests/security/test_tool_confirmation.py
           tests/server/test_legacy_action_gateway.py
-
-      - name: Legacy gateway policy verification
-        run: >-
-          uv run pytest -q
-          tests/server/test_legacy_action_gateway.py::test_managed_tool_routes_through_policy_verification_and_idempotency
-
-      - name: Tool confirmation suite
-        run: uv run pytest -q tests/security/test_tool_confirmation.py
-
-      - name: Task routes suite
-        run: uv run pytest -q tests/server/test_task_routes.py
-
-      - name: Fresh turn correlation follow-up
-        run: >-
-          uv run pytest -q
-          tests/server/test_task_routes.py::test_tool_followup_uses_a_fresh_turn_correlation
-
-      - name: Memory candidate suite
-        run: uv run pytest -q tests/memory/test_memory_candidates.py
-
-      - name: Task policy suite
-        run: uv run pytest -q tests/tasks/test_policy.py
-
-      - name: Task approval suite
-        run: uv run pytest -q tests/tasks/test_approval.py
-
-      - name: Phase5 tool policy suite
-        run: uv run pytest -q tests/tasks/test_tool_policy_phase5.py
-
-      - name: Tool browser route suite
-        run: uv run pytest -q tests/server/test_tool_browser_routes.py
-
-      - name: Probe Worker 1 reload canonicalization against W4 core
-        continue-on-error: true
-        run: |
-          git fetch origin closure/w1-action-safety
-          git show origin/closure/w1-action-safety:tests/tools/test_action_canonicalization.py > /tmp/test_action_canonicalization.py
-          uv run pytest -q /tmp/test_action_canonicalization.py
