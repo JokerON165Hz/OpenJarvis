@@ -153,10 +153,11 @@ class ToolExecutor:
                 success=False,
             )
 
-        # Strict manifest validation is always enforced.  The model-facing
-        # schema is not merely documentation and unknown parameters fail
-        # closed.  ``_taint`` is an internal OpenJarvis label, never a model
-        # capability, and is removed before schema validation.
+        # Resolve the trusted manifest and fail closed on availability before
+        # any user-facing confirmation. Strict argument validation remains a
+        # mandatory pre-execution gate below, after confirmation, so the
+        # callback can receive the exact proposed arguments under the legacy
+        # confirmation contract without making malformed arguments executable.
         taint_set = params.pop("_taint", None) if isinstance(params, dict) else None
         try:
             manifest = self._manifest_catalog.get(tool.tool_id)
@@ -164,7 +165,6 @@ class ToolExecutor:
                 raise ValueError(manifest.degraded_reason or "tool is disabled")
             if not manifest.supports_current_platform():
                 raise ValueError("tool is not supported on this platform")
-            params = manifest.validate_arguments(params)
         except (TypeError, ValueError) as exc:
             return ToolResult(
                 tool_name=tool_call.name,
@@ -176,10 +176,10 @@ class ToolExecutor:
         if self._boundary_guard is not None and not getattr(tool, "is_local", True):
             try:
                 tool_call = self._boundary_guard.check_outbound(tool_call)
-                # Re-parse arguments after potential redaction
+                # Re-parse arguments after potential redaction. Schema
+                # validation still occurs at the common pre-execution gate.
                 params = json.loads(tool_call.arguments) if tool_call.arguments else {}
                 params.pop("_taint", None)
-                params = manifest.validate_arguments(params)
             except Exception as exc:
                 return ToolResult(
                     tool_name=tool_call.name,
@@ -238,7 +238,9 @@ class ToolExecutor:
             except ImportError:
                 pass
 
-        # Confirmation check for sensitive tools
+        # Confirmation check for sensitive tools. This intentionally precedes
+        # schema validation so the callback observes the exact proposed args;
+        # approval does not bypass the strict manifest gate below.
         if tool.spec.requires_confirmation:
             if not self._interactive or self._confirm_callback is None:
                 return ToolResult(
@@ -257,6 +259,18 @@ class ToolExecutor:
                     content=f"Tool '{tool_call.name}' execution denied by user.",
                     success=False,
                 )
+
+        # Strict manifest validation remains mandatory before any tool side
+        # effect. Unknown or malformed arguments fail closed even after an
+        # affirmative confirmation callback.
+        try:
+            params = manifest.validate_arguments(params)
+        except (TypeError, ValueError) as exc:
+            return ToolResult(
+                tool_name=tool_call.name,
+                content=f"Manifest validation failed: {exc}",
+                success=False,
+            )
 
         # Emit start event. ``agent`` carries the managed-agent UUID so the
         # AgentExecutor's trace subscriber (which filters by agent_id) can
