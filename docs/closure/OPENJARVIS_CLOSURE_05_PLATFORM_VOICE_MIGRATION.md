@@ -2,14 +2,16 @@
 
 ## Status
 
-- Base: `26ed6fcf30fd1f2f2473c29b7fcd5e736a91931e`
+- Frozen base / implementation SHA: `26ed6fcf30fd1f2f2473c29b7fcd5e736a91931e`
 - Branch: `closure/w5-platform-voice-migration`
 - Target: `integration/jarvis-operator-final`
-- Remote SHA at final verification: `26ed6fcf30fd1f2f2473c29b7fcd5e736a91931e`
+- Handoff-only remote SHA before this documentation correction: `f755a3f681d27946a67f864d83e3400b77ab93c6`
+- Product-code delta from frozen base: none; required code/test writes were blocked before publication
 - `.github/workflows/ci.yml`: unchanged; owned by Worker 2 / final integrator
+- Draft PR: not opened; PR creation was blocked by the connected GitHub write-safety layer
 - `READY_FOR_INTEGRATION: NO`
 
-This handoff records the completed K3 diagnosis and the exact remaining changes. The connected GitHub write boundary blocked publication of the required W5 code/security-test changes, including a migration-only tree created directly from the frozen base. No security control was weakened or bypassed, no force update was attempted, and no merge was performed.
+This handoff records the completed K3 diagnosis and the exact remaining changes. The connected GitHub write boundary blocked publication of the required W5 code/security-test changes, including a migration-only tree created directly from the frozen base. No security control was weakened or bypassed, no force update was attempted, and no merge was performed. The only remote W5 delta is this documentation handoff.
 
 ## 1. Platform gating
 
@@ -95,7 +97,7 @@ Prepared correction:
 
 This satisfies the required ordering: validation happens before copy/mutation, a preflight failure leaves no partial destination, and recovery behavior is deterministic.
 
-A migration-only tree containing exactly this change was created directly from the frozen base, but GitHub publication was blocked by the connected write-safety layer before a commit/ref update occurred.
+A migration-only tree containing exactly this change was created directly from the frozen base, but GitHub publication was blocked by the connected write-safety layer before a code commit/ref update occurred.
 
 ## 7. Git secure / module isolation
 
@@ -120,14 +122,14 @@ Classification: W5 test/tool-contract compatibility, not W1 Action-Service seman
 
 ## 9. Validation evidence
 
-Requested commands were not claimed as executed because the private repository is not available in the local execution container and connector writes never produced a runnable W5 remote candidate:
+Requested commands were not claimed as executed because the private repository is not available in the local execution container and connector writes never produced a runnable W5 code candidate:
 
-- `uv run pytest -q tests/speech` — not executed on a W5 candidate
-- `uv run pytest -q tests/migration/test_backup.py` — not executed on a W5 candidate
-- `uv run pytest -q tests/tools/test_git_secure.py` — not executed on a W5 candidate
-- `ruff check <changed files>` — not executed on a W5 candidate
-- `ruff format --check <changed files>` — not executed on a W5 candidate
-- `git diff --check` — not executed on a W5 candidate
+- `uv run pytest -q tests/speech` — not executed on a W5 code candidate
+- `uv run pytest -q tests/migration/test_backup.py` — not executed on a W5 code candidate
+- `uv run pytest -q tests/tools/test_git_secure.py` — not executed on a W5 code candidate
+- `ruff check <changed files>` — not executed on a W5 code candidate
+- `ruff format --check <changed files>` — not executed on a W5 code candidate
+- `git diff --check` — not executed on a W5 code candidate
 
 Existing baseline evidence does prove both dedicated Windows launcher ownership jobs (3.12 and 3.13) pass before W5 changes.
 
@@ -149,4 +151,4 @@ Before this worker can be marked ready, the following must be published and vali
 
 `READY_FOR_INTEGRATION: NO`
 
-Reason: required W5 code/test changes could not be published through the connected GitHub write boundary in this run. The remote branch remains at the frozen base and no Draft PR was opened because there is no valid remote W5 implementation candidate to review.
+Reason: required W5 code/test changes could not be published through the connected GitHub write boundary in this run. The remote branch contains only this blocker/handoff documentation on top of the frozen base. Draft-PR creation against `integration/jarvis-operator-final` was attempted and blocked by the same write-safety layer. No merge was performed.
