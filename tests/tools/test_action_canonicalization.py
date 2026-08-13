@@ -27,6 +27,12 @@ class ReloadedActionStatus(str, Enum):
     COMPLETED = "completed"
 
 
+class UnknownActionStatus(str, Enum):
+    """Unknown status value from an isolated/reloaded enum class."""
+
+    UNKNOWN = "future_unknown"
+
+
 class ManifestStub:
     tool_id = "file.read"
     capability = "file:read"
@@ -123,3 +129,13 @@ def test_action_status_reload_does_not_allow_invalid_transition() -> None:
 
     with pytest.raises(ActionStoreError, match="validated -> completed"):
         ActionStore._check_transition(current, ReloadedActionStatus.COMPLETED)
+
+
+def test_action_status_boundary_rejects_raw_string_status() -> None:
+    with pytest.raises(ActionStoreError, match="action status must be an enum member"):
+        ActionStore._canonical_status("validated")
+
+
+def test_action_status_boundary_rejects_unknown_enum_value() -> None:
+    with pytest.raises(ActionStoreError, match="unknown action status: 'future_unknown'"):
+        ActionStore._canonical_status(UnknownActionStatus.UNKNOWN)
