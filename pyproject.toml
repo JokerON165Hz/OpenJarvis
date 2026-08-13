@@ -36,6 +36,7 @@ dependencies = [
     "nvidia-ml-py>=12.560.30",
     "posthog>=3.0",
     "python-telegram-bot>=22.6",
+    "ruamel.yaml>=0.18,<0.19",
     "rich>=13",
     "tomli>=2.0; python_version < '3.11'",
     "tomlkit>=0.12",
@@ -92,6 +93,7 @@ desktop = [
     "python-multipart>=0.0.9",
     "faster-whisper>=1.0",
 ]
+codex = ["openai-codex==0.144.4"]
 openhands = ["openhands-sdk>=1.0; python_version >= '3.12'"]
 gpu-metrics = ["pynvml>=12.0"]
 energy-amd = ["amdsmi>=6.1"]
@@ -218,6 +220,7 @@ markers = [
 [tool.ruff]
 target-version = "py310"
 src = ["src", "tests"]
+line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]

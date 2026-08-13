@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
 import { Outlet, useNavigate } from 'react-router';
-import { ApprovalBell } from './ApprovalBell';
 import { Sidebar } from './Sidebar/Sidebar';
 import { SystemPulse } from './SystemPulse';
 import { useAppStore } from '../lib/store';
 import { checkHealth } from '../lib/api';
+import { DesktopCloseGuard } from './Desktop/DesktopCloseGuard';
 
 export function Layout() {
   const sidebarOpen = useAppStore((s) => s.sidebarOpen);
@@ -27,9 +27,8 @@ export function Layout() {
   return (
     <div className="flex flex-col h-full w-full overflow-hidden relative" style={{ paddingTop: '3px' }}>
       <div className="hud-backdrop" aria-hidden="true" />
+      <DesktopCloseGuard />
       <SystemPulse apiReachable={apiReachable} />
-      <ApprovalBell />
-
       {/* Health check banner */}
       {apiReachable === false && (
         <div

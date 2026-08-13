@@ -1,16 +1,11 @@
-"""Persistent memory service: async fact extraction integrated into core.
+"""Persistent memory service with controlled durable fact promotion.
 
-``MemoryService`` runs fact extraction on a dedicated background thread so it
-never blocks ``jarvis serve`` request handling or the ``jarvis chat`` REPL.
-Callers hand off an exchange via :meth:`submit`, which enqueues the work and
-returns immediately — the slow model call and disk write happen out of band.
-The worker swallows every per-job error (including ``BrokenPipeError`` when a
-client disconnects mid-extraction), so a flaky extraction model can never take
-down the host process.
-
-The service is started and stopped as part of the OpenJarvis lifecycle (see
-``cli/serve.py`` and ``cli/chat_cmd.py``) and is configured through the
-``[memory]`` section of ``config.toml``.
+``MemoryService`` keeps extraction off the request path, but extracted model
+output is advisory only. A model suggestion is never silently promoted to a
+durable fact. The legacy fact store accepts only an explicit, directly
+storable remember request from the user. Composite requests that depend on a
+tool, website, or research result must complete first and enter the vault via
+the evidence-backed candidate workflow.
 """
 
 from __future__ import annotations
@@ -31,7 +26,7 @@ _STOP = object()
 
 
 class MemoryService:
-    """Background long-term-memory extraction and persistence service."""
+    """Background extraction with explicit-only legacy fact persistence."""
 
     def __init__(
         self,
@@ -157,11 +152,23 @@ class MemoryService:
 
     def _process(self, job: Any) -> None:
         user_text, assistant_text = job
-        facts = self._extractor.extract(user_text, assistant_text)
-        if facts:
-            stored = self._store.add_many(facts, source="auto")
-            if stored:
-                logger.debug("Memory service stored %d new fact(s)", stored)
+        suggestions = self._extractor.extract(user_text, assistant_text)
+
+        # Import lazily so this legacy service does not create a module-level
+        # dependency cycle with the vault candidate workflow.
+        from openjarvis.memory.candidates import recognize_memory_request
+
+        confirmed = recognize_memory_request(user_text)
+        if confirmed is None:
+            if suggestions:
+                logger.debug(
+                    "Memory extractor produced %d suggestion(s); not persisted "
+                    "without explicit confirmation",
+                    len(suggestions),
+                )
+            return
+        if self._store.add(confirmed, source="user"):
+            logger.debug("Memory service stored one explicitly confirmed fact")
 
     # -- store passthroughs -------------------------------------------------
 
@@ -186,12 +193,8 @@ def build_memory_service(
 
     Reads the ``[memory]`` section (``config.memory`` / ``config.tools.storage``)
     for ``enabled``, ``backend``, ``extraction_model``, ``max_facts`` and
-    ``facts_path``.  Returns ``None`` when memory is disabled or no engine /
-    extraction model is available, so callers can simply do::
-
-        svc = build_memory_service(config, engine, model)
-        if svc is not None:
-            svc.start()
+    ``facts_path``. Returns ``None`` when memory is disabled or no engine /
+    extraction model is available.
     """
     mem = getattr(config, "memory", None)
     if mem is None or not getattr(mem, "enabled", False):

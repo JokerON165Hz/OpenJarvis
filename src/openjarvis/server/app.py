@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import threading
 import time
+from contextlib import asynccontextmanager
+from inspect import isawaitable
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -140,6 +144,81 @@ class _NoCacheStaticFiles(StaticFiles):
         await super().__call__(scope, receive, _send_with_headers)
 
 
+async def _cleanup_call(resource: Any, method_name: str, *args: Any) -> None:
+    if resource is None:
+        return
+    method = getattr(resource, method_name, None)
+    if method is None:
+        return
+    result = method(*args)
+    if isawaitable(result):
+        await result
+
+
+async def _shutdown_app_resources(app: FastAPI) -> None:
+    """Close app-owned resources once, in dependency-safe reverse order."""
+
+    if getattr(app.state, "shutdown_complete", False):
+        return
+    app.state.shutdown_complete = True
+    app.state._mcp_shutdown = True
+
+    websocket_shutdown = getattr(app.state, "websocket_shutdown", None)
+    if websocket_shutdown is not None:
+        try:
+            result = websocket_shutdown()
+            if isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("WebSocket shutdown failed", exc_info=True)
+
+    browser = getattr(app.state, "browser_session_service", None)
+    if browser is not None:
+        try:
+            for session in tuple(browser.list()):
+                try:
+                    browser.close(session.session_id)
+                except Exception:
+                    logger.debug("Owned browser session shutdown failed", exc_info=True)
+        except Exception:
+            logger.debug("Browser shutdown inventory failed", exc_info=True)
+
+    for client in tuple(getattr(app.state, "_mcp_clients", ())):
+        try:
+            await _cleanup_call(client, "close")
+        except Exception:
+            logger.debug("MCP client shutdown failed", exc_info=True)
+
+    if getattr(app.state, "owns_task_runtime", False):
+        for attribute, method in (
+            ("codex_orchestrator", "close"),
+            ("task_store", "close"),
+            ("trace_store", "close"),
+        ):
+            try:
+                await _cleanup_call(getattr(app.state, attribute, None), method)
+            except Exception:
+                logger.debug("%s shutdown failed", attribute, exc_info=True)
+    elif getattr(app.state, "owns_trace_store", False):
+        try:
+            await _cleanup_call(getattr(app.state, "trace_store", None), "close")
+        except Exception:
+            logger.debug("trace_store shutdown failed", exc_info=True)
+
+    for attribute, method in (
+        ("desktop_controller", "close"),
+        ("tts_backend", "close"),
+        ("vault_memory_service", "close"),
+        ("memory_service", "stop"),
+        ("analytics_bridge", "stop"),
+        ("analytics_client", "shutdown"),
+    ):
+        try:
+            await _cleanup_call(getattr(app.state, attribute, None), method)
+        except Exception:
+            logger.debug("%s shutdown failed", attribute, exc_info=True)
+
+
 def create_app(
     engine,
     model: str,
@@ -152,9 +231,26 @@ def create_app(
     config=None,
     memory_backend=None,
     memory_service=None,
+    vault_memory_service=None,
     speech_backend=None,
+    tts_backend=None,
     agent_manager=None,
     agent_scheduler=None,
+    trace_store=None,
+    task_store=None,
+    task_service=None,
+    approval_broker=None,
+    codex_orchestrator=None,
+    recovery_coordinator=None,
+    tool_action_service=None,
+    browser_session_service=None,
+    desktop_controller=None,
+    mcp_server_registry=None,
+    phase7_learning_runtime=None,
+    phase7_skill_test_runner=None,
+    phase7_healthcheck_runner=None,
+    flow_authority=None,
+    owns_task_runtime: bool = False,
     api_key: str = "",
     webhook_config: dict | None = None,
     cors_origins: list[str] | None = None,
@@ -176,10 +272,50 @@ def create_app(
     config:
         Optional JarvisConfig for other settings.
     """
+
+    @asynccontextmanager
+    async def lifespan(runtime_app: FastAPI):
+        runtime_app.state.lifecycle_started = True
+        flow_monitor = None
+        try:
+            from openjarvis.flow import WindowsSessionLockMonitor
+
+            authority = runtime_app.state.flow_authority
+            flow_monitor = WindowsSessionLockMonitor(
+                authority.lock,
+                is_flow=authority.is_flow,
+            )
+            flow_monitor.start()
+            action_service = getattr(
+                runtime_app.state, "tool_action_service", None
+            )
+            recover_incomplete = getattr(
+                action_service, "recover_incomplete", None
+            )
+            if callable(recover_incomplete):
+                recover_incomplete()
+            _restore_sendblue_bindings(runtime_app)
+            if getattr(runtime_app.state, "mcp_server_registry", None) is not None:
+                from openjarvis.mcp.action_bridge import discover_action_tools
+
+                threading.Thread(
+                    target=discover_action_tools,
+                    args=(runtime_app.state,),
+                    kwargs={"force": True},
+                    name="openjarvis-mcp-discovery",
+                    daemon=True,
+                ).start()
+            yield
+        finally:
+            if flow_monitor is not None:
+                flow_monitor.stop()
+            await _shutdown_app_resources(runtime_app)
+
     app = FastAPI(
         title="OpenJarvis API",
         description="OpenAI-compatible API server for OpenJarvis",
         version="0.1.0",
+        lifespan=lifespan,
     )
 
     from fastapi.middleware.cors import CORSMiddleware
@@ -223,9 +359,30 @@ def create_app(
     app.state.config = config
     app.state.memory_backend = memory_backend
     app.state.memory_service = memory_service
+    app.state.vault_memory_service = vault_memory_service
     app.state.speech_backend = speech_backend
+    app.state.tts_backend = tts_backend
     app.state.agent_manager = agent_manager
     app.state.agent_scheduler = agent_scheduler
+    app.state.task_store = task_store
+    app.state.task_service = task_service
+    app.state.approval_broker = approval_broker
+    app.state.codex_orchestrator = codex_orchestrator
+    app.state.recovery_coordinator = recovery_coordinator
+    app.state.tool_action_service = tool_action_service
+    app.state.browser_session_service = browser_session_service
+    app.state.desktop_controller = desktop_controller
+    app.state.mcp_server_registry = mcp_server_registry
+    app.state.phase7_learning_runtime = phase7_learning_runtime
+    app.state.phase7_skill_test_runner = phase7_skill_test_runner
+    app.state.phase7_healthcheck_runner = phase7_healthcheck_runner
+    if flow_authority is None:
+        from openjarvis.flow import FlowSessionAuthority
+
+        flow_authority = FlowSessionAuthority.from_environment()
+    app.state.flow_authority = flow_authority
+    app.state.owns_task_runtime = owns_task_runtime
+    app.state.shutdown_complete = False
     app.state.session_start = time.time()
     # Exposed so WebSocket handlers can authenticate the handshake (the HTTP
     # AuthMiddleware never sees WS upgrade requests). Empty = auth disabled.
@@ -241,16 +398,19 @@ def create_app(
     # UNIQUE constraint on trace_id (a 500 on every completion). Keeping the
     # collector the single writer is what makes the dual code path safe; only
     # the telemetry store is bus-subscribed (see system/builder.py).
-    app.state.trace_store = None
-    try:
-        from openjarvis.core.config import load_config
-        from openjarvis.traces.store import TraceStore
+    app.state.trace_store = trace_store
+    app.state.owns_trace_store = False
+    if trace_store is None:
+        try:
+            from openjarvis.core.config import load_config
+            from openjarvis.traces.store import TraceStore
 
-        cfg = config if config is not None else load_config()
-        if cfg.traces.enabled:
-            app.state.trace_store = TraceStore(db_path=cfg.traces.db_path)
-    except Exception:
-        pass  # traces are optional; don't block server startup
+            cfg = config if config is not None else load_config()
+            if cfg.traces.enabled:
+                app.state.trace_store = TraceStore(db_path=cfg.traces.db_path)
+                app.state.owns_trace_store = True
+        except Exception:
+            pass  # traces are optional; don't block server startup
 
     # Wire up external analytics if enabled (PostHog) — never block startup.
     # Note: we do NOT fire app_opened here. The frontend owns that event
@@ -277,34 +437,8 @@ def create_app(
                 _bridge.start()
                 app.state.analytics_bridge = _bridge
 
-            @app.on_event("shutdown")
-            async def _shutdown_analytics() -> None:
-                bridge = getattr(app.state, "analytics_bridge", None)
-                if bridge is not None:
-                    try:
-                        bridge.stop()
-                    except Exception:
-                        pass
-                client = getattr(app.state, "analytics_client", None)
-                if client is not None:
-                    try:
-                        client.shutdown()
-                    except Exception:
-                        pass
     except Exception as _exc:
         logger.debug("Analytics init skipped: %s", _exc)
-
-    # Stop the background memory service cleanly when the server shuts down.
-    if memory_service is not None:
-
-        @app.on_event("shutdown")
-        async def _shutdown_memory_service() -> None:
-            svc = getattr(app.state, "memory_service", None)
-            if svc is not None:
-                try:
-                    svc.stop()
-                except Exception:
-                    pass
 
     app.include_router(router)
     app.include_router(dashboard_router)
@@ -315,9 +449,6 @@ def create_app(
     app.include_router(research_router)
     app.include_router(analytics_router)
     include_all_routes(app)
-
-    # Restore SendBlue channel bindings from database on startup
-    _restore_sendblue_bindings(app)
 
     # Add security headers middleware
     try:

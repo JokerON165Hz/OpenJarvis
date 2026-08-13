@@ -944,6 +944,20 @@ class StorageConfig:
         default_factory=lambda: str(get_config_dir() / "memory_facts.jsonl")
     )
 
+    # Human-readable Markdown vault memory. An empty path keeps the subsystem
+    # disabled and, importantly, never creates or probes a default vault.
+    vault_path: str = ""
+    vault_index_path: str = field(
+        default_factory=lambda: str(get_config_dir() / "vault-memory.sqlite3")
+    )
+    vault_restore_path: str = field(
+        default_factory=lambda: str(get_config_dir() / "vault-memory-restore")
+    )
+    vault_mode: str = "read-only"
+    vault_embeddings_enabled: bool = False
+    vault_watch_enabled: bool = False
+    vault_poll_interval_seconds: float = 2.0
+
 
 # Backward-compatibility alias
 MemoryConfig = StorageConfig
@@ -1440,13 +1454,21 @@ class OperatorsConfig:
 
 @dataclass(slots=True)
 class SpeechConfig:
-    """Speech-to-text settings."""
+    """Local speech-to-text and text-to-speech settings."""
 
+    # "auto" is deliberately local-only. Cloud backends require an explicit
+    # provider name and are never selected merely because an env key exists.
     backend: str = "auto"  # "auto", "faster-whisper", "openai", "deepgram"
     model: str = "base"  # Whisper model size: tiny, base, small, medium, large-v3
-    language: str = ""  # Empty = auto-detect
+    language: str = "de"  # Phase-6 default; callers may explicitly override.
     device: str = "auto"  # "auto", "cpu", "cuda"
     compute_type: str = "float16"  # "float16", "int8", "float32"
+    stt_runtime_path: str = ""
+    tts_enabled: bool = False
+    tts_backend: str = "chatterbox"
+    tts_fallback_backend: str = "piper"
+    tts_voice_id: str = "jarvis-deep-calm"
+    tts_runtime_path: str = ""
 
 
 @dataclass(slots=True)
@@ -1577,6 +1599,37 @@ class DigestConfig:
     )
 
 
+@dataclass(slots=True)
+class CodexBackendConfig:
+    """Safe defaults for the optional Codex backend integration."""
+
+    enabled: bool = False
+    primary_backend: str = "python_sdk"
+    approval_mode: str = "deny_all"
+    analysis_sandbox: str = "read_only"
+    model: str = ""
+    reasoning_effort: str = ""
+    service_tier: str = ""
+    require_model_confirmation: bool = False
+    default_timeout_seconds: float = 300.0
+    default_step_limit: int = 100
+    default_token_limit: int = 0
+    max_turn_duration: float = 300.0
+    max_steps: int = 100
+    max_input_tokens: int = 200_000
+    max_output_tokens: int = 32_000
+    max_total_tokens_per_task: int = 500_000
+    warning_threshold: float = 0.8
+    hard_limit_action: str = "interrupt"
+    state_db_path: str = field(
+        default_factory=lambda: str(get_config_dir() / "codex_state.db")
+    )
+    app_server_binary: str = ""
+    cli_binary: str = ""
+    allow_cli_fallback: bool = False
+    allow_global_cli_override: bool = False
+
+
 @dataclass
 class JarvisConfig:
     """Top-level configuration for OpenJarvis."""
@@ -1611,6 +1664,7 @@ class JarvisConfig:
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     digest: DigestConfig = field(default_factory=DigestConfig)
     proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
+    codex: CodexBackendConfig = field(default_factory=CodexBackendConfig)
     mining: Optional["MiningConfig"] = None
 
     @property
@@ -1873,6 +1927,7 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
             "system_prompt",
             "compression",
             "skills",
+            "codex",
         )
         for section_name in top_sections:
             if section_name in data:
