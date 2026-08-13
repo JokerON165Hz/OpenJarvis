@@ -200,7 +200,7 @@ class ActionStore:
 
     @staticmethod
     def _check_transition(current: ToolAction, status: ActionStatus) -> None:
-        if status is current.status:
+        if status == current.status:
             return
         if status not in _ACTION_TRANSITIONS[current.status]:
             raise ActionStoreError(
@@ -395,9 +395,9 @@ class ActionStore:
                 current = self._action_locked(action_id)
                 if current is None:
                     raise ActionStoreError(f"unknown action: {action_id}")
-                allowed = current.status is ActionStatus.VALIDATED or (
+                allowed = current.status == ActionStatus.VALIDATED or (
                     allow_failed
-                    and current.status is ActionStatus.FAILED
+                    and current.status == ActionStatus.FAILED
                     and current.effect_known
                 )
                 if not allowed:
@@ -429,7 +429,7 @@ class ActionStore:
                 current = self._action_locked(action_id)
                 if current is None:
                     raise ActionStoreError(f"unknown action: {action_id}")
-                if current.status is ActionStatus.RECOVERY_REQUIRED:
+                if current.status == ActionStatus.RECOVERY_REQUIRED:
                     self._commit()
                     return current
                 if current.status not in {ActionStatus.RUNNING, ActionStatus.VERIFYING}:
