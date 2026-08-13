@@ -5,7 +5,11 @@ from __future__ import annotations
 from enum import Enum
 from types import SimpleNamespace
 
+import pytest
+
 from openjarvis.tools.action_service import ToolActionService
+from openjarvis.tools.action_store import ActionStore, ActionStoreError
+from openjarvis.tools.actions import ActionStatus
 from openjarvis.tools.manifest import SideEffectClass
 
 
@@ -14,6 +18,13 @@ class ReloadedSideEffect(str, Enum):
 
     LOCAL_READ = "local_read"
     EXTERNAL_WRITE = "external_write"
+
+
+class ReloadedActionStatus(str, Enum):
+    """Equivalent action status values from an isolated/reloaded enum class."""
+
+    VALIDATED = "validated"
+    COMPLETED = "completed"
 
 
 class ManifestStub:
@@ -99,3 +110,16 @@ def test_execution_binding_still_rejects_real_side_effect_drift() -> None:
         ManifestStub(),
         "fingerprint",
     ) == "action side effect differs from its proposal or manifest"
+
+
+def test_action_status_noop_transition_is_reload_safe() -> None:
+    current = SimpleNamespace(status=ActionStatus.VALIDATED)
+
+    ActionStore._check_transition(current, ReloadedActionStatus.VALIDATED)
+
+
+def test_action_status_reload_does_not_allow_invalid_transition() -> None:
+    current = SimpleNamespace(status=ActionStatus.VALIDATED)
+
+    with pytest.raises(ActionStoreError, match="validated -> completed"):
+        ActionStore._check_transition(current, ReloadedActionStatus.COMPLETED)
