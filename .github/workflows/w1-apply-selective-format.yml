@@ -1,0 +1,64 @@
+name: W1 Apply Selective Format
+
+on:
+  push:
+    branches:
+      - closure/w1-action-safety
+
+permissions:
+  contents: write
+
+jobs:
+  apply-format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout current W1 branch
+        uses: actions/checkout@v6
+        with:
+          ref: closure/w1-action-safety
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.0.0
+
+      - name: Install development dependencies
+        run: uv sync --extra dev
+
+      - name: Format only W1 changed Python files
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run ruff format \
+            src/openjarvis/tools/action_service.py \
+            src/openjarvis/tools/action_store.py \
+            src/openjarvis/tools/manifest.py \
+            tests/tools/test_action_canonicalization.py
+          git diff --check
+          git status --short
+
+      - name: Commit selective format result
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- \
+            src/openjarvis/tools/action_service.py \
+            src/openjarvis/tools/action_store.py \
+            src/openjarvis/tools/manifest.py \
+            tests/tools/test_action_canonicalization.py; then
+            echo "No formatting changes required."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            src/openjarvis/tools/action_service.py \
+            src/openjarvis/tools/action_store.py \
+            src/openjarvis/tools/manifest.py \
+            tests/tools/test_action_canonicalization.py
+          git commit -m "style: format w1 changed python files"
+          git push origin HEAD:closure/w1-action-safety
