@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+from enum import Enum
 from pathlib import Path
 
 from openjarvis.tools.actions import (
@@ -139,6 +140,17 @@ class ActionStore:
         canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _canonical_status(status: object) -> ActionStatus:
+        """Normalize enum members across reload boundaries without string coercion."""
+
+        if not isinstance(status, Enum):
+            raise ActionStoreError("action status must be an enum member")
+        try:
+            return ActionStatus(status.value)
+        except (TypeError, ValueError) as exc:
+            raise ActionStoreError(f"unknown action status: {status.value!r}") from exc
+
     def _begin_immediate(self) -> None:
         self._conn.execute("BEGIN IMMEDIATE")
 
@@ -200,12 +212,14 @@ class ActionStore:
 
     @staticmethod
     def _check_transition(current: ToolAction, status: ActionStatus) -> None:
-        if status == current.status:
+        current_status = ActionStore._canonical_status(current.status)
+        next_status = ActionStore._canonical_status(status)
+        if next_status == current_status:
             return
-        if status not in _ACTION_TRANSITIONS[current.status]:
+        if next_status not in _ACTION_TRANSITIONS[current_status]:
             raise ActionStoreError(
                 "invalid action transition "
-                f"{current.status.value} -> {status.value}"
+                f"{current_status.value} -> {next_status.value}"
             )
 
     def put_proposal(self, proposal: ToolProposal) -> ToolProposal:
@@ -327,7 +341,9 @@ class ActionStore:
 
         if not statuses:
             return ()
-        values = tuple(sorted(status.value for status in statuses))
+        values = tuple(
+            sorted(self._canonical_status(status).value for status in statuses)
+        )
         placeholders = ", ".join("?" for _value in values)
         with self._lock:
             rows = self._conn.execute(
@@ -354,16 +370,17 @@ class ActionStore:
     ) -> ToolAction:
         """Apply one state transition under a cross-process SQLite write lock."""
 
+        canonical_status = self._canonical_status(status)
         with self._lock:
             self._begin_immediate()
             try:
                 current = self._action_locked(action_id)
                 if current is None:
                     raise ActionStoreError(f"unknown action: {action_id}")
-                self._check_transition(current, status)
+                self._check_transition(current, canonical_status)
                 updated = self._with_changes(
                     current,
-                    status,
+                    canonical_status,
                     verification_status=verification_status,
                     approval_id=approval_id,
                     tool_run_id=tool_run_id,
