@@ -1,0 +1,145 @@
+name: W1 Closeout Validation
+
+on:
+  push:
+    branches:
+      - closure/w1-action-safety
+
+permissions:
+  contents: read
+
+jobs:
+  w1-core:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact W1 validation target
+        uses: actions/checkout@v6
+        with:
+          ref: b910876083006e1a9526f9d0484d3cd10952cd5b
+          fetch-depth: 0
+
+      - name: Assert validation identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "b910876083006e1a9526f9d0484d3cd10952cd5b"
+          git merge-base --is-ancestor 26ed6fcf30fd1f2f2473c29b7fcd5e736a91931e HEAD
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.0.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra framework-comparison --extra server
+
+      - name: Build Rust extension
+        run: uv run maturin develop --manifest-path rust/crates/openjarvis-python/Cargo.toml
+
+      - name: Prepare runtime directory
+        run: mkdir -p "$HOME/.openjarvis"
+
+      - name: Changed-file quality gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=26ed6fcf30fd1f2f2473c29b7fcd5e736a91931e
+          mapfile -t PY_FILES < <(git diff --name-only "$BASE...HEAD" -- '*.py')
+          printf 'W1 changed Python files:\n%s\n' "${PY_FILES[*]}"
+          test "${#PY_FILES[@]}" -gt 0
+          uv run ruff check "${PY_FILES[@]}"
+          uv run ruff format --check "${PY_FILES[@]}"
+          git diff --check "$BASE...HEAD"
+
+      - name: SideEffect and ActionStatus canonicalization
+        run: uv run pytest -q tests/tools/test_action_canonicalization.py
+
+      - name: Manifest safety
+        run: uv run pytest -q tests/tools/test_manifest.py
+
+      - name: Action service core
+        run: uv run pytest -q tests/tools/test_action_service.py
+
+      - name: Operator action safety
+        run: uv run pytest -q tests/tools/test_operator_action_service.py
+
+      - name: Critical safety contracts
+        run: |
+          uv run pytest -q \
+            tests/tools/test_operator_action_service.py::test_parallel_services_claim_same_action_once \
+            tests/tools/test_operator_action_service.py::test_crash_after_effect_requires_recovery_without_reexecution \
+            tests/tools/test_operator_action_service.py::test_startup_recovery_marks_every_inflight_effect_without_reexecution \
+            tests/tools/test_operator_action_service.py::test_global_stop_cancels_inflight_action_and_blocks_late_revival \
+            tests/tools/test_operator_action_service.py::test_failed_external_postcondition_is_recovery_not_success \
+            tests/tools/test_operator_action_service.py::test_direct_execute_cannot_bypass_retry_policy \
+            tests/tools/test_operator_action_service.py::test_persisted_risk_floor_and_manifest_snapshot_cannot_drop \
+            tests/tools/test_operator_action_service.py::test_tool_output_cannot_lower_policy_and_secrets_are_redacted \
+            tests/tools/test_manifest.py::test_manifest_rejects_level_four_execution
+
+  w4-compat:
+    runs-on: ubuntu-latest
+    needs: w1-core
+    steps:
+      - name: Checkout exact W1 validation target
+        uses: actions/checkout@v6
+        with:
+          ref: b910876083006e1a9526f9d0484d3cd10952cd5b
+          fetch-depth: 0
+
+      - name: Combine W4 functional head in runner only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "OpenJarvis Closure Validation"
+          git config user.email "closure-validation@users.noreply.github.com"
+          git fetch origin 198a7b896fef06d2e3e299ac3cf4e075e5ab26fb
+          git merge --no-commit --no-ff 198a7b896fef06d2e3e299ac3cf4e075e5ab26fb
+          git status --short
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.0.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra framework-comparison --extra server
+
+      - name: Build Rust extension
+        run: uv run maturin develop --manifest-path rust/crates/openjarvis-python/Cargo.toml
+
+      - name: Prepare runtime directory
+        run: mkdir -p "$HOME/.openjarvis"
+
+      - name: W4 tool browser compatibility
+        run: uv run pytest -q tests/server/test_tool_browser_routes.py
+
+      - name: W4 legacy action gateway compatibility
+        run: uv run pytest -q tests/server/test_legacy_action_gateway.py
+
+      - name: W4 confirmation compatibility
+        run: uv run pytest -q tests/security/test_tool_confirmation.py
+
+      - name: W4 policy compatibility
+        run: uv run pytest -q tests/tasks/test_policy.py
+
+      - name: W4 approval compatibility
+        run: uv run pytest -q tests/tasks/test_approval.py
+
+      - name: W4 phase5 tool policy compatibility
+        run: uv run pytest -q tests/tasks/test_tool_policy_phase5.py
