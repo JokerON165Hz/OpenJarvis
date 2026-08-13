@@ -1,0 +1,65 @@
+name: W1 Selective Format Artifact
+
+on:
+  push:
+    branches:
+      - closure/w1-action-safety
+
+permissions:
+  contents: read
+
+jobs:
+  format-artifact:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout W1 formatting target
+        uses: actions/checkout@v6
+        with:
+          ref: b910876083006e1a9526f9d0484d3cd10952cd5b
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.0.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Format only W1 changed Python files
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run ruff format \
+            src/openjarvis/tools/action_service.py \
+            src/openjarvis/tools/action_store.py \
+            src/openjarvis/tools/manifest.py \
+            tests/tools/test_action_canonicalization.py
+          git diff --check
+          git diff --binary -- \
+            src/openjarvis/tools/action_service.py \
+            src/openjarvis/tools/action_store.py \
+            src/openjarvis/tools/manifest.py \
+            tests/tools/test_action_canonicalization.py \
+            > w1-ruff-format.patch
+          mkdir -p formatted
+          cp --parents \
+            src/openjarvis/tools/action_service.py \
+            src/openjarvis/tools/action_store.py \
+            src/openjarvis/tools/manifest.py \
+            tests/tools/test_action_canonicalization.py \
+            formatted/
+
+      - name: Upload selective format artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: w1-ruff-format-b910
+          path: |
+            w1-ruff-format.patch
+            formatted/
+          if-no-files-found: error
