@@ -110,12 +110,15 @@ def test_execution_binding_still_rejects_real_side_effect_drift() -> None:
         idempotency_key="idem-1",
     )
 
-    assert service._validate_execution_binding(
-        action,
-        proposal,
-        ManifestStub(),
-        "fingerprint",
-    ) == "action side effect differs from its proposal or manifest"
+    assert (
+        service._validate_execution_binding(
+            action,
+            proposal,
+            ManifestStub(),
+            "fingerprint",
+        )
+        == "action side effect differs from its proposal or manifest"
+    )
 
 
 def test_action_status_noop_transition_is_reload_safe() -> None:

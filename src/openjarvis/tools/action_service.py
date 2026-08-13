@@ -113,9 +113,7 @@ class ToolActionService:
             self.catalog.register(manifest)
             existing = self._runtimes.get(manifest.tool_id)
             if existing is not None and existing is not runtime:
-                raise ToolActionError(
-                    f"tool runtime is already registered: {manifest.tool_id}"
-                )
+                raise ToolActionError(f"tool runtime is already registered: {manifest.tool_id}")
             self._runtimes[manifest.tool_id] = runtime
 
     def refresh_runtime(
@@ -128,9 +126,7 @@ class ToolActionService:
         with self._registry_lock:
             existing = self.catalog.get(manifest.tool_id)
             if existing != manifest:
-                raise ToolActionError(
-                    f"tool manifest changed during runtime refresh: {manifest.tool_id}"
-                )
+                raise ToolActionError(f"tool manifest changed during runtime refresh: {manifest.tool_id}")
             self._runtimes[manifest.tool_id] = runtime
 
     def replace_runtime_policy(
@@ -155,12 +151,8 @@ class ToolActionService:
                 "enabled",
                 "degraded_reason",
             }
-            if existing.model_dump(exclude=mutable_policy_fields) != manifest.model_dump(
-                exclude=mutable_policy_fields
-            ):
-                raise ToolActionError(
-                    f"tool schema changed during runtime refresh: {manifest.tool_id}"
-                )
+            if existing.model_dump(exclude=mutable_policy_fields) != manifest.model_dump(exclude=mutable_policy_fields):
+                raise ToolActionError(f"tool schema changed during runtime refresh: {manifest.tool_id}")
             self.catalog.replace(manifest)
             if manifest.enabled:
                 self._runtimes[manifest.tool_id] = runtime
@@ -185,9 +177,7 @@ class ToolActionService:
         with self._interrupt_lock:
             self._interrupted_tasks.add(task_id)
             active = tuple(
-                runtime
-                for active_task_id, runtime in self._active_runtimes.values()
-                if active_task_id == task_id
+                runtime for active_task_id, runtime in self._active_runtimes.values() if active_task_id == task_id
             )
         interrupted = 0
         for runtime in active:
@@ -207,9 +197,7 @@ class ToolActionService:
         handler or verifier, because the external effect may already exist.
         """
 
-        incomplete = self.store.list_actions_by_status(
-            {ActionStatus.RUNNING, ActionStatus.VERIFYING}
-        )
+        incomplete = self.store.list_actions_by_status({ActionStatus.RUNNING, ActionStatus.VERIFYING})
         return tuple(self.recover(action.action_id) for action in incomplete)
 
     def global_stop(self) -> tuple[ToolAction, ...]:
@@ -341,18 +329,14 @@ class ToolActionService:
             if action.status == ActionStatus.COMPLETED:
                 return action
             if action.status == ActionStatus.RECOVERY_REQUIRED:
-                raise ToolActionError(
-                    "action requires recovery because the prior effect is unknown"
-                )
+                raise ToolActionError("action requires recovery because the prior effect is unknown")
             if action.status == ActionStatus.FAILED and not allow_failed:
                 raise ToolActionError("failed actions may only run through retry()")
             if action.status not in {
                 ActionStatus.VALIDATED,
                 ActionStatus.FAILED,
             }:
-                raise ToolActionError(
-                    f"action cannot execute from {action.status.value}"
-                )
+                raise ToolActionError(f"action cannot execute from {action.status.value}")
             if self._task_interrupted(action.task_id):
                 raise ToolActionError("tool chain was stopped by the owner")
 
@@ -409,9 +393,7 @@ class ToolActionService:
             action.action_id,
             ActionStatus.CANCELED,
             effect_known=effect_known,
-            verification_status=(
-                VerificationStatus.UNKNOWN if not effect_known else None
-            ),
+            verification_status=(VerificationStatus.UNKNOWN if not effect_known else None),
             error=("action canceled while effect was in flight" if not effect_known else None),
         )
         with self._interrupt_lock:
@@ -498,9 +480,7 @@ class ToolActionService:
         if not claimed:
             if action.status in {ActionStatus.COMPLETED, ActionStatus.CANCELED}:
                 return action
-            raise ToolActionError(
-                f"action execution is already claimed or blocked: {action.status.value}"
-            )
+            raise ToolActionError(f"action execution is already claimed or blocked: {action.status.value}")
 
         self._emit(action, "tool.started", {"timeout": manifest.timeout})
         with self._interrupt_lock:
@@ -548,9 +528,7 @@ class ToolActionService:
             self._emit(action, "tool.canceled", {"reason": "owner_stop"})
             return action
         if current.status != ActionStatus.RUNNING:
-            raise ToolActionError(
-                f"action left running state unexpectedly: {current.status.value}"
-            )
+            raise ToolActionError(f"action left running state unexpectedly: {current.status.value}")
         action = current
 
         output_payload = redact_data(output)
@@ -668,10 +646,7 @@ class ToolActionService:
             task = self._tasks.get(proposal.task_id)
             if task is None:
                 return "proposal references an unknown task"
-            if (
-                task.session_id != proposal.session_id
-                or task.correlation_id != proposal.correlation_id
-            ):
+            if task.session_id != proposal.session_id or task.correlation_id != proposal.correlation_id:
                 return "proposal identity differs from canonical task"
         if context.proposal_capability != proposal.capability:
             return "trusted context does not match proposal capability"
@@ -742,9 +717,7 @@ class ToolActionService:
             raise ToolActionError("Flow action lease is missing, stale, or task-mismatched")
         return replace(
             context,
-            granted_capabilities=frozenset(
-                (*context.granted_capabilities, action_lease.grant)
-            ),
+            granted_capabilities=frozenset((*context.granted_capabilities, action_lease.grant)),
         )
 
     def _store_output(

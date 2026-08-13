@@ -29,9 +29,7 @@ class ActionIdempotencyConflict(ActionStoreError):
 
 
 _ACTION_TRANSITIONS: dict[ActionStatus, frozenset[ActionStatus]] = {
-    ActionStatus.PROPOSED: frozenset(
-        {ActionStatus.VALIDATED, ActionStatus.DENIED, ActionStatus.CANCELED}
-    ),
+    ActionStatus.PROPOSED: frozenset({ActionStatus.VALIDATED, ActionStatus.DENIED, ActionStatus.CANCELED}),
     ActionStatus.VALIDATED: frozenset(
         {
             ActionStatus.WAITING_APPROVAL,
@@ -40,9 +38,7 @@ _ACTION_TRANSITIONS: dict[ActionStatus, frozenset[ActionStatus]] = {
             ActionStatus.CANCELED,
         }
     ),
-    ActionStatus.WAITING_APPROVAL: frozenset(
-        {ActionStatus.RUNNING, ActionStatus.DENIED, ActionStatus.CANCELED}
-    ),
+    ActionStatus.WAITING_APPROVAL: frozenset({ActionStatus.RUNNING, ActionStatus.DENIED, ActionStatus.CANCELED}),
     ActionStatus.RUNNING: frozenset(
         {
             ActionStatus.VERIFYING,
@@ -169,8 +165,7 @@ class ActionStore:
 
     def _proposal_action_locked(self, proposal_id: str) -> ToolAction | None:
         row = self._conn.execute(
-            "SELECT payload_json FROM tool_actions WHERE proposal_id = ? "
-            "ORDER BY rowid LIMIT 1",
+            "SELECT payload_json FROM tool_actions WHERE proposal_id = ? ORDER BY rowid LIMIT 1",
             (proposal_id,),
         ).fetchone()
         return ToolAction.model_validate_json(row[0]) if row else None
@@ -217,10 +212,7 @@ class ActionStore:
         if next_status == current_status:
             return
         if next_status not in _ACTION_TRANSITIONS[current_status]:
-            raise ActionStoreError(
-                "invalid action transition "
-                f"{current_status.value} -> {next_status.value}"
-            )
+            raise ActionStoreError(f"invalid action transition {current_status.value} -> {next_status.value}")
 
     def put_proposal(self, proposal: ToolProposal) -> ToolProposal:
         """Atomically bind a task-scoped idempotency key to one proposal payload."""
@@ -231,15 +223,12 @@ class ActionStore:
             self._begin_immediate()
             try:
                 existing = self._conn.execute(
-                    "SELECT payload_hash, payload_json FROM tool_proposals "
-                    "WHERE task_id = ? AND idempotency_key = ?",
+                    "SELECT payload_hash, payload_json FROM tool_proposals WHERE task_id = ? AND idempotency_key = ?",
                     (proposal.task_id, proposal.idempotency_key),
                 ).fetchone()
                 if existing is not None:
                     if existing["payload_hash"] != payload_hash:
-                        raise ActionIdempotencyConflict(
-                            "idempotency key was reused with a different proposal"
-                        )
+                        raise ActionIdempotencyConflict("idempotency key was reused with a different proposal")
                     result = ToolProposal.model_validate_json(existing["payload_json"])
                     self._commit()
                     return result
@@ -289,9 +278,7 @@ class ActionStore:
                     return existing, False
                 try:
                     self._conn.execute(
-                        "INSERT INTO tool_actions "
-                        "(action_id, task_id, proposal_id, payload_json) "
-                        "VALUES (?, ?, ?, ?)",
+                        "INSERT INTO tool_actions (action_id, task_id, proposal_id, payload_json) VALUES (?, ?, ?, ?)",
                         (
                             action.action_id,
                             action.task_id,
@@ -327,8 +314,7 @@ class ActionStore:
     def list_actions(self, task_id: str) -> tuple[ToolAction, ...]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT payload_json FROM tool_actions WHERE task_id = ? "
-                "ORDER BY rowid",
+                "SELECT payload_json FROM tool_actions WHERE task_id = ? ORDER BY rowid",
                 (task_id,),
             ).fetchall()
         return tuple(ToolAction.model_validate_json(row[0]) for row in rows)
@@ -341,9 +327,7 @@ class ActionStore:
 
         if not statuses:
             return ()
-        values = tuple(
-            sorted(self._canonical_status(status).value for status in statuses)
-        )
+        values = tuple(sorted(self._canonical_status(status).value for status in statuses))
         placeholders = ", ".join("?" for _value in values)
         with self._lock:
             rows = self._conn.execute(
@@ -413,9 +397,7 @@ class ActionStore:
                 if current is None:
                     raise ActionStoreError(f"unknown action: {action_id}")
                 allowed = current.status == ActionStatus.VALIDATED or (
-                    allow_failed
-                    and current.status == ActionStatus.FAILED
-                    and current.effect_known
+                    allow_failed and current.status == ActionStatus.FAILED and current.effect_known
                 )
                 if not allowed:
                     self._commit()
@@ -450,9 +432,7 @@ class ActionStore:
                     self._commit()
                     return current
                 if current.status not in {ActionStatus.RUNNING, ActionStatus.VERIFYING}:
-                    raise ActionStoreError(
-                        "recovery can only capture running or verifying actions"
-                    )
+                    raise ActionStoreError("recovery can only capture running or verifying actions")
                 self._check_transition(current, ActionStatus.RECOVERY_REQUIRED)
                 updated = current.model_copy(
                     update={
@@ -475,8 +455,7 @@ class ActionStore:
             if self.get_action(artifact.action_id) is None:
                 raise ActionStoreError(f"unknown action: {artifact.action_id}")
             self._conn.execute(
-                "INSERT INTO tool_artifacts "
-                "(artifact_id, action_id, payload_json) VALUES (?, ?, ?)",
+                "INSERT INTO tool_artifacts (artifact_id, action_id, payload_json) VALUES (?, ?, ?)",
                 (artifact.artifact_id, artifact.action_id, self._json(artifact)),
             )
         return artifact
@@ -484,8 +463,7 @@ class ActionStore:
     def list_artifacts(self, action_id: str) -> tuple[ToolArtifact, ...]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT payload_json FROM tool_artifacts WHERE action_id = ? "
-                "ORDER BY rowid",
+                "SELECT payload_json FROM tool_artifacts WHERE action_id = ? ORDER BY rowid",
                 (action_id,),
             ).fetchall()
         return tuple(ToolArtifact.model_validate_json(row[0]) for row in rows)
@@ -495,8 +473,7 @@ class ActionStore:
             if self.get_action(event.action_id) is None:
                 raise ActionStoreError(f"unknown action: {event.action_id}")
             self._conn.execute(
-                "INSERT INTO tool_events "
-                "(event_id, action_id, event_type, payload_json) VALUES (?, ?, ?, ?)",
+                "INSERT INTO tool_events (event_id, action_id, event_type, payload_json) VALUES (?, ?, ?, ?)",
                 (
                     event.event_id,
                     event.action_id,
@@ -509,8 +486,7 @@ class ActionStore:
     def list_events(self, action_id: str) -> tuple[ToolEvent, ...]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT payload_json FROM tool_events WHERE action_id = ? "
-                "ORDER BY sequence",
+                "SELECT payload_json FROM tool_events WHERE action_id = ? ORDER BY sequence",
                 (action_id,),
             ).fetchall()
         return tuple(ToolEvent.model_validate_json(row[0]) for row in rows)

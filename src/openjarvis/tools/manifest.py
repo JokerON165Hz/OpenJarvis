@@ -108,10 +108,7 @@ class ToolManifest(BaseModel):
             raise ValueError("tool input_schema properties/required are invalid")
         unknown_required = set(required) - set(properties)
         if unknown_required:
-            raise ValueError(
-                "required fields missing from properties: "
-                + ", ".join(sorted(unknown_required))
-            )
+            raise ValueError("required fields missing from properties: " + ", ".join(sorted(unknown_required)))
         return value
 
     @field_validator("output_schema")
@@ -127,11 +124,7 @@ class ToolManifest(BaseModel):
             raise ValueError("at least one allowed lane is required")
         if not self.supported_platforms:
             raise ValueError("at least one supported platform is required")
-        if (
-            self.enabled
-            and int(self.risk_level)
-            == int(RiskLevel.FINANCIAL_OR_SECURITY_CRITICAL)
-        ):
+        if self.enabled and int(self.risk_level) == int(RiskLevel.FINANCIAL_OR_SECURITY_CRITICAL):
             raise ValueError("level-4 tools must be disabled")
         if not self.enabled and not self.degraded_reason:
             raise ValueError("disabled tools require degraded_reason")
@@ -258,19 +251,11 @@ def manifest_from_spec(tool_id: str, spec: Any) -> ToolManifest:
 
     name = str(spec.name)
     capabilities = tuple(str(value) for value in spec.required_capabilities)
-    capability = (
-        capabilities[0]
-        if capabilities
-        else _CAPABILITY_BY_NAME.get(name, "tool:invoke")
-    )
+    capability = capabilities[0] if capabilities else _CAPABILITY_BY_NAME.get(name, "tool:invoke")
 
     if name in _READ_ONLY_NAMES:
         risk = RiskLevel.READ_ONLY
-        side_effect = (
-            SideEffectClass.LOCAL_READ
-            if not name.startswith("browser_")
-            else SideEffectClass.NONE
-        )
+        side_effect = SideEffectClass.LOCAL_READ if not name.startswith("browser_") else SideEffectClass.NONE
     elif name in _REVERSIBLE_WRITE_NAMES:
         risk = RiskLevel.REVERSIBLE_WORKSPACE
         side_effect = SideEffectClass.REVERSIBLE_LOCAL_WRITE
@@ -293,11 +278,7 @@ def manifest_from_spec(tool_id: str, spec: Any) -> ToolManifest:
 
     browser = name.startswith("browser_")
     lane = ExecutionLane.INTERACTIVE if browser or risk >= 2 else ExecutionLane.MODEL
-    network = (
-        NetworkPolicy.EXPLICIT_ALLOWLIST
-        if browser or capability == "network:fetch"
-        else NetworkPolicy.DENY
-    )
+    network = NetworkPolicy.EXPLICIT_ALLOWLIST if browser or capability == "network:fetch" else NetworkPolicy.DENY
     retryable = risk == RiskLevel.READ_ONLY
     enabled = True
     return ToolManifest(
@@ -329,9 +310,7 @@ def manifest_from_spec(tool_id: str, spec: Any) -> ToolManifest:
             else IdempotencyPolicy.NEVER_AFTER_UNKNOWN_EFFECT
         ),
         side_effect_class=side_effect,
-        verification_strategy=(
-            "observe_expected_state" if risk else "validate_result_shape"
-        ),
+        verification_strategy=("observe_expected_state" if risk else "validate_result_shape"),
         undo_strategy=(
             "restore_artifact_required"
             if side_effect == SideEffectClass.REVERSIBLE_LOCAL_WRITE
@@ -377,9 +356,7 @@ class ToolManifestCatalog:
         existing = self._manifests.get(manifest.tool_id)
         if existing is not None:
             if existing != manifest:
-                raise ManifestValidationError(
-                    f"conflicting manifest registration: {manifest.tool_id}"
-                )
+                raise ManifestValidationError(f"conflicting manifest registration: {manifest.tool_id}")
             return existing
         self._manifests[manifest.tool_id] = manifest
         return manifest
@@ -421,9 +398,7 @@ def _validate_schema_value(
             matches += 1
         required_matches = 1
         if matches < required_matches or ("oneOf" in schema and matches != 1):
-            raise ManifestValidationError(
-                f"{path}: no unique schema alternative matched"
-            )
+            raise ManifestValidationError(f"{path}: no unique schema alternative matched")
         return
     expected = schema.get("type")
     if isinstance(expected, list):
@@ -478,9 +453,7 @@ def _validate_schema_value(
         unknown = set(value) - set(properties)
         additional = schema.get("additionalProperties")
         if unknown and (additional is False or (strict and additional is None)):
-            raise ManifestValidationError(
-                f"{path}: unknown parameters: {', '.join(sorted(unknown))}"
-            )
+            raise ManifestValidationError(f"{path}: unknown parameters: {', '.join(sorted(unknown))}")
         if unknown and isinstance(additional, Mapping):
             for key in unknown:
                 _validate_schema_value(
@@ -491,9 +464,7 @@ def _validate_schema_value(
                 )
         elif unknown and additional is not True and not isinstance(additional, Mapping):
             if unknown:
-                raise ManifestValidationError(
-                    f"{path}: unknown parameters: {', '.join(sorted(unknown))}"
-                )
+                raise ManifestValidationError(f"{path}: unknown parameters: {', '.join(sorted(unknown))}")
         for key, child in value.items():
             child_schema = properties.get(key)
             if child_schema is not None:
